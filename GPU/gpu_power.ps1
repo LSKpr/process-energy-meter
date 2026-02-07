@@ -12,7 +12,7 @@
 .PARAMETER WeightSM
     Weight constant for SM utilization (default: 1.0)
 .PARAMETER WeightMem
-    Weight constant for Memory utilization (default: 5.0)
+    Weight constant for Memory utilization (default: 0.5)
 .PARAMETER WeightEnc
     Weight constant for Encoder utilization (default: 0.25)
 .PARAMETER WeightDec
@@ -35,6 +35,7 @@ class GPUPowerMonitor {
     [double]$SampleIntervalSec
     [System.Collections.ArrayList]$Samples
     [hashtable]$ProcessEnergy
+    [double]$GpuEnergy
     [string]$GpuName
     [double]$GpuIdlePower
     [int]$IdleProcessCount
@@ -51,6 +52,7 @@ class GPUPowerMonitor {
         $this.SampleIntervalSec = $sampleIntervalMs / 1000.0
         $this.Samples = [System.Collections.ArrayList]::new()
         $this.ProcessEnergy = @{}
+        $this.GpuEnergy = 0.0
         $this.IdleProcesses = @{}
         $this.WeightA = $a
         $this.WeightB = $b
@@ -77,7 +79,8 @@ class GPUPowerMonitor {
                 Write-Host "ERROR: Target process '$($this.TargetProcess)' not found running on GPU.`n" -ForegroundColor Red
                 $this.ListGpuProcesses()
                 exit 1
-            } else {
+            }
+            else {
                 Write-Host "Tracking target process: $($this.TargetProcess)"
             }
         }
@@ -89,11 +92,12 @@ class GPUPowerMonitor {
         # Take multiple samples to get a stable idle measurement
         $idleSamples = @()
         for ($i = 0; $i -lt 10; $i++) {
-            $powerOutput = nvidia-smi --query-gpu=power.draw --format=csv,noheader,nounits 2>$null
+            $powerOutput = nvidia-smi --query-gpu=power.draw.instant --format=csv,noheader,nounits 2>$null
             if ($powerOutput -and $powerOutput.Trim() -ne '[N/A]') {
                 try {
                     $idleSamples += [double]$powerOutput.Trim()
-                } catch {}
+                }
+                catch {}
             }
             Start-Sleep -Milliseconds 100
         }
@@ -107,11 +111,13 @@ class GPUPowerMonitor {
                 Write-Host "WARNING: Measured idle power ($("{0:F1}" -f $measuredIdle) W) is suspiciously high." -ForegroundColor Red
                 Write-Host "       This usually means a game is already running."
                 Write-Host "       Defaulting Idle Power to 15.0 W to ensure correct attribution." -ForegroundColor Yellow
-            } else {
+            }
+            else {
                 $this.GpuIdlePower = $measuredIdle
                 $this.GpuIdlePower = 1
             }
-        } else {
+        }
+        else {
             # Default fallback - conservative estimate
             $this.GpuIdlePower = 1
             Write-Host "Warning: Could not measure idle power, using default: $($this.GpuIdlePower)W" -ForegroundColor Yellow
@@ -151,32 +157,33 @@ class GPUPowerMonitor {
                         continue
                     }
                     
-                    # Parse: gpu pid type sm mem enc dec command
-                    # Example: 0   1234    C   45   30    0    0   python.exe
-                    if ($line -match '^\s*(\d+)\s+(\d+)\s+(\w+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(.+?)\s*$') {
+                    # Parse:   gpu pid   type sm   mem   enc  dec command
+                    # Example: 0   1234  C    45   30    0    0   python.exe
+                    if ($line -match '^\s*(\d+)\s+(\d+)\s+([A-Z+]+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(.+?)\s*$') {
                         $processId = [int]$Matches[2]
                         $smUtil = $this.ParseUtil($Matches[4])
                         $memUtil = $this.ParseUtil($Matches[5])
                         $encUtil = $this.ParseUtil($Matches[6])
                         $decUtil = $this.ParseUtil($Matches[7])
-                        $command = $Matches[8].Trim()
+                        $command = $Matches[10].Trim()
                         
                         # Get memory usage
                         $memMB = $this.GetProcessMemory($processId)
                         
                         $processes += [PSCustomObject]@{
-                            ProcessId = $processId
-                            ProcessName = $command
+                            ProcessId    = $processId
+                            ProcessName  = $command
                             UsedMemoryMB = $memMB
-                            SmUtil = $smUtil
-                            MemUtil = $memUtil
-                            EncUtil = $encUtil
-                            DecUtil = $decUtil
+                            SmUtil       = $smUtil
+                            MemUtil      = $memUtil
+                            EncUtil      = $encUtil
+                            DecUtil      = $decUtil
                         }
                     }
                 }
             }
-        } catch {
+        }
+        catch {
             Write-Host "Warning: Could not parse pmon output" -ForegroundColor Yellow
         }
         
@@ -189,16 +196,17 @@ class GPUPowerMonitor {
                     if ($proc) {
                         $memMB = $this.GetProcessMemory($processId)
                         $processes += [PSCustomObject]@{
-                            ProcessId = $processId
-                            ProcessName = $proc.ProcessName
+                            ProcessId    = $processId
+                            ProcessName  = $proc.ProcessName
                             UsedMemoryMB = $memMB
-                            SmUtil = 0.0
-                            MemUtil = 0.0
-                            EncUtil = 0.0
-                            DecUtil = 0.0
+                            SmUtil       = 0.0
+                            MemUtil      = 0.0
+                            EncUtil      = 0.0
+                            DecUtil      = 0.0
                         }
                     }
-                } catch {
+                }
+                catch {
                     continue
                 }
             }
@@ -214,7 +222,8 @@ class GPUPowerMonitor {
         }
         try {
             return [double]$value
-        } catch {
+        }
+        catch {
             return 0.0
         }
     }
@@ -234,7 +243,8 @@ class GPUPowerMonitor {
                     }
                 }
             }
-        } catch {}
+        }
+        catch {}
         
         return 100.0  # Default fallback
     }
@@ -250,7 +260,8 @@ class GPUPowerMonitor {
                     }
                 }
             }
-        } catch {}
+        }
+        catch {}
         return $pids | Select-Object -Unique
     }
 
@@ -259,11 +270,12 @@ class GPUPowerMonitor {
         Write-Host "GPU processes currently running:"
         if ($processes.Count -eq 0) {
             Write-Host "  None"
-        } else {
+        }
+        else {
             foreach ($proc in $processes) {
                 Write-Host ("  PID {0}: {1} (Mem: {2} MB, SM: {3}%, Mem: {4}%, Enc: {5}%, Dec: {6}%)" -f `
-                    $proc.ProcessId, $proc.ProcessName, $proc.UsedMemoryMB, `
-                    $proc.SmUtil, $proc.MemUtil, $proc.EncUtil, $proc.DecUtil)
+                        $proc.ProcessId, $proc.ProcessName, $proc.UsedMemoryMB, `
+                        $proc.SmUtil, $proc.MemUtil, $proc.EncUtil, $proc.DecUtil)
             }
         }
     }
@@ -275,27 +287,34 @@ class GPUPowerMonitor {
         $this.LastSampleTime = $now
         
         # Get current GPU power draw
-        $powerOutput = nvidia-smi --query-gpu=power.draw --format=csv,noheader,nounits 2>$null
+        $powerOutput = nvidia-smi --query-gpu=power.draw.instant --format=csv,noheader,nounits 2>$null
         $gpuPower = 0.0
         if ($powerOutput -and $powerOutput.Trim() -ne '[N/A]') {
             try {
                 $gpuPower = [double]$powerOutput.Trim()
-            } catch {
+            }
+            catch {
                 $gpuPower = 0.0
             }
         }
+        $this.GpuEnergy += ($gpuPower * $dtSeconds)
 
         # Get overall GPU utilization
-        $utilOutput = nvidia-smi --query-gpu=utilization.gpu,utilization.memory --format=csv,noheader,nounits 2>$null
+        $utilOutput = nvidia-smi --query-gpu=utilization.gpu,utilization.memory,utilization.encoder,utilization.decoder --format=csv,noheader,nounits 2>$null
         $gpuSmUtil = 0.0
         $gpuMemUtil = 0.0
+        $gpuEncUtil = 0.0
+        $gpuDecUtil = 0.0
         if ($utilOutput) {
             $parts = $utilOutput -split ',\s*'
-            if ($parts.Count -ge 2) {
+            if ($parts.Count -ge 4) {
                 try {
                     $gpuSmUtil = [double]$parts[0].Trim()
                     $gpuMemUtil = [double]$parts[1].Trim()
-                } catch {}
+                    $gpuEncUtil = [double]$parts[3].Trim()
+                    $gpuDecUtil = [double]$parts[4].Trim()
+                }
+                catch {}
             }
         }
 
@@ -306,8 +325,8 @@ class GPUPowerMonitor {
         # Calculate total GPU weighted utilization
         # GPU_weighted = a * GPU_SM + b * GPU_Mem + c * GPU_Enc + d * GPU_Dec
         # For overall GPU, we approximate Enc and Dec as 0 since they're not directly reported
-        $gpuEncUtil = 0.0
-        $gpuDecUtil = 0.0
+        # $gpuEncUtil = 0.0
+        # $gpuDecUtil = 0.0
         
         # Sum all process encoder/decoder usage to estimate total
         foreach ($proc in $processes) {
@@ -316,21 +335,21 @@ class GPUPowerMonitor {
         }
 
         $gpuWeightedTotal = $this.WeightA * $gpuSmUtil + `
-                           $this.WeightB * $gpuMemUtil + `
-                           $this.WeightC * $gpuEncUtil + `
-                           $this.WeightD * $gpuDecUtil
+            $this.WeightB * $gpuMemUtil + `
+            $this.WeightC * $gpuEncUtil + `
+            $this.WeightD * $gpuDecUtil
         
         if ($gpuWeightedTotal -eq 0) { $gpuWeightedTotal = 1.0 }
 
         # Record sample
         $timestamp = (Get-Date).ToUniversalTime().ToString("o")
         [void]$this.Samples.Add([PSCustomObject]@{
-            Timestamp = $timestamp
-            PowerW = $gpuPower
-            GpuSmUtil = $gpuSmUtil
-            GpuMemUtil = $gpuMemUtil
-            ProcessCount = $currentProcessCount
-        })
+                Timestamp    = $timestamp
+                PowerW       = $gpuPower
+                GpuSmUtil    = $gpuSmUtil
+                GpuMemUtil   = $gpuMemUtil
+                ProcessCount = $currentProcessCount
+            })
 
         # Calculate power for each process using the formula:
         # P_pwr = (GPU_idle/N) + ((a*P_SM + b*P_Mem + c*P_Enc + d*P_Dec) / (a*GPU_SM + b*GPU_Mem + c*GPU_Enc + d*GPU_Dec)) * (GPU_pwr - GPU_idle)
@@ -351,7 +370,8 @@ class GPUPowerMonitor {
             if ($this.IdleProcesses.ContainsKey($processName)) {
                 # This process was running during idle measurement
                 $idleContribution = $this.GpuIdlePower / $this.IdleProcessCount
-            } else {
+            }
+            else {
                 # New process - split idle among current processes
                 if ($currentProcessCount -gt 0) {
                     $idleContribution = $this.GpuIdlePower / $currentProcessCount
@@ -360,9 +380,9 @@ class GPUPowerMonitor {
 
             # Calculate weighted utilization for this process
             $procWeighted = $this.WeightA * $proc.SmUtil + `
-                           $this.WeightB * $proc.MemUtil + `
-                           $this.WeightC * $proc.EncUtil + `
-                           $this.WeightD * $proc.DecUtil
+                $this.WeightB * $proc.MemUtil + `
+                $this.WeightC * $proc.EncUtil + `
+                $this.WeightD * $proc.DecUtil
 
             # Calculate proportional active power
             $activeFraction = if ($gpuWeightedTotal -gt 0) { $procWeighted / $gpuWeightedTotal } else { 0 }
@@ -398,7 +418,8 @@ class GPUPowerMonitor {
                     Start-Sleep -Milliseconds $this.SampleIntervalMs
                 }
             }
-        } catch {
+        }
+        catch {
             Write-Host "`nMonitoring interrupted" -ForegroundColor Yellow
         }
 
@@ -409,16 +430,24 @@ class GPUPowerMonitor {
     [void] Report([double]$duration) {
         # Calculate total energy
         $totalProcessEnergyJ = ($this.ProcessEnergy.Values | Measure-Object -Sum).Sum
-        
+        $totalGpuEnergyJ = $this.GpuEnergy
+
         # Correct J to kWh conversion
         # 1 Wh = 3600 J
         # 1 kWh = 3,600,000 J
-        $totalEnergyKwh = $totalProcessEnergyJ / 60.0
+        $totalGpuEnergyKwh = $totalGpuEnergyJ / 60.0
+        $totalProcessEnergyKwh = $totalProcessEnergyJ / 60.0
 
         # Calculate average power
         $avgPower = if ($this.Samples.Count -gt 0) {
             ($this.Samples | Measure-Object -Property PowerW -Average).Average
-        } else { 0 }
+        }
+        else { 0 }
+
+        $coveragePct = if ($totalGpuEnergyJ -gt 0) {
+            ($totalProcessEnergyJ / $totalGpuEnergyJ) * 100.0
+        } 
+        else { 0 }
 
         Write-Host "`n========== GPU POWER MONITORING RESULTS =========="
         Write-Host ("GPU: {0}" -f $this.GpuName)
@@ -426,12 +455,15 @@ class GPUPowerMonitor {
         Write-Host ("Samples collected: {0}" -f $this.Samples.Count)
         Write-Host ("GPU Idle Power: {0:F2} W" -f $this.GpuIdlePower)
         Write-Host ("Average GPU Power: {0:F2} W" -f $avgPower)
-        Write-Host ("Total GPU Energy: {0:F6} kWh ({1:F2} J)" -f $totalEnergyKwh, $totalProcessEnergyJ)
+        Write-Host ("Total GPU Energy: {0:F6} kWh ({1:F2} J)" -f $totalGpuEnergyKwh, $totalGpuEnergyJ)
+        Write-Host ("Attributed Process Energy: {0:F6} kWh ({1:F2} J)" -f $totalProcessEnergyKwh, $totalProcessEnergyJ)
+        Write-Host ("Attribution coverage: {0:F1} %" -f $coveragePct)
 
         Write-Host "`n====== PER-PROCESS ENERGY ATTRIBUTION ======"
         if ($this.ProcessEnergy.Count -eq 0) {
             Write-Host "  No process data collected"
-        } else {
+        }
+        else {
             $processEnergyTotal = ($this.ProcessEnergy.Values | Measure-Object -Sum).Sum
             
             foreach ($entry in $this.ProcessEnergy.GetEnumerator() | Sort-Object Value -Descending) {
@@ -442,7 +474,7 @@ class GPUPowerMonitor {
                 $pct = if ($processEnergyTotal -gt 0) { ($energyJ / $processEnergyTotal * 100) } else { 0 }
                 
                 Write-Host ("{0,-35} {1,10:F6} kWh  ({2,6:F2} J)  Avg: {3,6:F2} W  ({4,5:F1}%)" -f `
-                    $name, $energyKwh, $energyJ, $avgPowerW, $pct)
+                        $name, $energyKwh, $energyJ, $avgPowerW, $pct)
             }
             
             Write-Host "`nNote: Process percentages are relative to total attributed energy."
@@ -466,7 +498,8 @@ class GPUPowerMonitor {
 try {
     $monitor = [GPUPowerMonitor]::new($Process, $SampleInterval, $WeightSM, $WeightMem, $WeightEnc, $WeightDec)
     $monitor.Run($Duration)
-} catch {
+}
+catch {
     Write-Error "Error: $_"
     exit 1
 }
