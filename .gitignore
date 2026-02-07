@@ -1,0 +1,9 @@
+# Obsolete files
+MsrReader.dll
+
+# Temporary downloads
+*.zip
+
+# Library folders
+LibreHardwareMonitor/
+LibreRelease/
