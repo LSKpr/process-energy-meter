@@ -114,7 +114,6 @@ class GPUPowerMonitor {
             }
             else {
                 $this.GpuIdlePower = $measuredIdle
-                $this.GpuIdlePower = 1
             }
         }
         else {
@@ -435,8 +434,8 @@ class GPUPowerMonitor {
         # Correct J to kWh conversion
         # 1 Wh = 3600 J
         # 1 kWh = 3,600,000 J
-        $totalGpuEnergyKwh = $totalGpuEnergyJ / 60.0
-        $totalProcessEnergyKwh = $totalProcessEnergyJ / 60.0
+        $totalGpuEnergyKwh = $totalGpuEnergyJ / 3600000.0
+        $totalProcessEnergyKwh = $totalProcessEnergyJ / 3600000.0
 
         # Calculate average power
         $avgPower = if ($this.Samples.Count -gt 0) {
@@ -469,7 +468,7 @@ class GPUPowerMonitor {
             foreach ($entry in $this.ProcessEnergy.GetEnumerator() | Sort-Object Value -Descending) {
                 $name = $entry.Key
                 $energyJ = $entry.Value
-                $energyKwh = $energyJ / 60.0
+                $energyKwh = $energyJ / 3600000.0
                 $avgPowerW = if ($duration -gt 0) { $energyJ / $duration } else { 0 }
                 $pct = if ($processEnergyTotal -gt 0) { ($energyJ / $processEnergyTotal * 100) } else { 0 }
                 
