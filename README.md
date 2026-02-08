@@ -53,6 +53,8 @@ Process Energy = Time × Power × (Process CPU / Total CPU)
 
 ### ProcessPowerMeter-CPU.ps1 (Dual Measurement)
 
+For RAPL Guide, please view the md file: [RAPL Guide](CPU/RAPL-Setup-Guide.md)
+
 **CPU-Only (RAPL):**
 1. Reads CPU package power directly from Intel MSR registers via LibreHardwareMonitor
 2. Allocates CPU power to processes based on their CPU utilization ratio
