@@ -5,7 +5,8 @@ param(
     [double]$WeightSM = 1.0,       # Weight for shader/compute utilization
     [double]$WeightMem = 0.5,      # Weight for memory bandwidth utilization
     [double]$WeightEnc = 0.25,     # Weight for video encoder utilization
-    [double]$WeightDec = 0.15      # Weight for video decoder utilization
+    [double]$WeightDec = 0.15,     # Weight for video decoder utilization
+    [string]$CsvOutput = "gpu_power_report.csv"  # CSV output file path
 )
 
 class GPUMultiMetricMonitor {
@@ -18,9 +19,12 @@ class GPUMultiMetricMonitor {
     [double]$WeightB  # Memory weight
     [double]$WeightC  # Encoder weight
     [double]$WeightD  # Decoder weight
+    [System.Collections.ArrayList]$SampleData = @()  # Store all samples
+    [datetime]$MonitoringStartTime
 
     GPUMultiMetricMonitor([double]$wSM, [double]$wMem, [double]$wEnc, [double]$wDec) {
         $this.LastSampleTime = Get-Date
+        $this.MonitoringStartTime = Get-Date
         $this.WeightA = $wSM
         $this.WeightB = $wMem
         $this.WeightC = $wEnc
@@ -125,6 +129,16 @@ class GPUMultiMetricMonitor {
             $totalWeighted += $weighted
         }
 
+        # Prepare sample data for CSV
+        $sampleTime = ($now - $this.MonitoringStartTime).TotalSeconds
+        $sampleRecord = @{
+            Timestamp = $now.ToString("yyyy-MM-dd HH:mm:ss.fff")
+            ElapsedSeconds = [math]::Round($sampleTime, 3)
+            TotalGpuPower_W = [math]::Round($gpuPower, 2)
+            TotalGpuEnergy_J = [math]::Round($this.TotalGpuEnergy, 2)
+            ProcessPowers = @{}
+        }
+
         if ($totalWeighted -le 0) {
             # No activity, split idle power equally
             $idlePowerPerProc = $this.GpuIdlePower / $processes.Count
@@ -134,32 +148,36 @@ class GPUMultiMetricMonitor {
                     $this.ProcessEnergy[$p.Name] = 0.0
                 }
                 $this.ProcessEnergy[$p.Name] += $energyJ
+                $sampleRecord.ProcessPowers[$p.Name] = [math]::Round($idlePowerPerProc, 2)
             }
-            return
+        } else {
+            $gpuActive = $gpuPower - $this.GpuIdlePower
+            if ($gpuActive -lt 0) { $gpuActive = 0 }
+
+            # Attribute power proportionally based on weighted utilization
+            foreach ($p in $processes) {
+                if ($p.WeightedUtil -le 0) {
+                    # Inactive process gets small idle share
+                    $power = ($this.GpuIdlePower * 0.05) / $processes.Count
+                } else {
+                    # Active process gets proportional share
+                    $fraction = $p.WeightedUtil / $totalWeighted
+                    $power = ($this.GpuIdlePower / $processes.Count) + ($fraction * $gpuActive)
+                }
+                
+                $energyJ = $power * $dt
+
+                if (-not $this.ProcessEnergy.ContainsKey($p.Name)) {
+                    $this.ProcessEnergy[$p.Name] = 0.0
+                }
+
+                $this.ProcessEnergy[$p.Name] += $energyJ
+                $sampleRecord.ProcessPowers[$p.Name] = [math]::Round($power, 2)
+            }
         }
 
-        $gpuActive = $gpuPower - $this.GpuIdlePower
-        if ($gpuActive -lt 0) { $gpuActive = 0 }
-
-        # Attribute power proportionally based on weighted utilization
-        foreach ($p in $processes) {
-            if ($p.WeightedUtil -le 0) {
-                # Inactive process gets small idle share
-                $power = ($this.GpuIdlePower * 0.05) / $processes.Count
-            } else {
-                # Active process gets proportional share
-                $fraction = $p.WeightedUtil / $totalWeighted
-                $power = ($this.GpuIdlePower / $processes.Count) + ($fraction * $gpuActive)
-            }
-            
-            $energyJ = $power * $dt
-
-            if (-not $this.ProcessEnergy.ContainsKey($p.Name)) {
-                $this.ProcessEnergy[$p.Name] = 0.0
-            }
-
-            $this.ProcessEnergy[$p.Name] += $energyJ
-        }
+        # Store the sample
+        [void]$this.SampleData.Add($sampleRecord)
     }
 
     [void] Run([int]$Duration, [int]$IntervalMs, [string]$TargetProcess) {
@@ -237,6 +255,97 @@ class GPUMultiMetricMonitor {
             Write-Host "`nTarget process used $($targetPct.ToString('F1'))% of total GPU power"
         }
     }
+
+    [void] WriteCsvReport([double]$Duration, [string]$TargetProcess, [string]$CsvPath) {
+        $csvData = @()
+        
+        # Add total GPU row
+        $avgGpuPower = $this.TotalGpuEnergy / $Duration
+        $csvData += [PSCustomObject]@{
+            ProcessName = "TOTAL_GPU"
+            AccumulativeEnergy_J = [math]::Round($this.TotalGpuEnergy, 2)
+            AveragePower_W = [math]::Round($avgGpuPower, 2)
+            PercentageOfTotal = 100.0
+        }
+        
+        # Add process rows
+        if ($this.ProcessEnergy.Count -gt 0) {
+            $entries = $this.ProcessEnergy.GetEnumerator()
+            
+            if ($TargetProcess) {
+                $entries = $entries | Where-Object { $_.Key -like "*$TargetProcess*" }
+            }
+            
+            $total = ($this.ProcessEnergy.GetEnumerator() | Measure-Object Value -Sum).Sum
+            
+            foreach ($e in $entries | Sort-Object Value -Descending) {
+                $avgPower = $e.Value / $Duration
+                $pct = if ($this.TotalGpuEnergy -gt 0) { 100 * $e.Value / $this.TotalGpuEnergy } else { 0 }
+                
+                $csvData += [PSCustomObject]@{
+                    ProcessName = $e.Key
+                    AccumulativeEnergy_J = [math]::Round($e.Value, 2)
+                    AveragePower_W = [math]::Round($avgPower, 2)
+                    PercentageOfTotal = [math]::Round($pct, 1)
+                }
+            }
+        }
+        
+        # Export summary to CSV
+        $csvData | Export-Csv -Path $CsvPath -NoTypeInformation -Encoding UTF8
+        Write-Host "`nSummary CSV report written to: $CsvPath" -ForegroundColor Green
+        
+        # Also write per-sample data
+        $samplesCsvPath = $CsvPath -replace '\.csv$', '_samples.csv'
+        $this.WriteSamplesCsv($samplesCsvPath, $TargetProcess)
+    }
+
+    [void] WriteSamplesCsv([string]$CsvPath, [string]$TargetProcess) {
+        if ($this.SampleData.Count -eq 0) {
+            Write-Host "No sample data to write." -ForegroundColor Yellow
+            return
+        }
+
+        # Get all unique process names across all samples
+        $allProcessNames = @()
+        foreach ($sample in $this.SampleData) {
+            foreach ($procName in $sample.ProcessPowers.Keys) {
+                if ($allProcessNames -notcontains $procName) {
+                    if (-not $TargetProcess -or $procName -like "*$TargetProcess*") {
+                        $allProcessNames += $procName
+                    }
+                }
+            }
+        }
+        $allProcessNames = $allProcessNames | Sort-Object
+
+        # Build CSV rows
+        $csvRows = @()
+        foreach ($sample in $this.SampleData) {
+            $row = [ordered]@{
+                Timestamp = $sample.Timestamp
+                ElapsedSeconds = $sample.ElapsedSeconds
+                TotalGpuPower_W = $sample.TotalGpuPower_W
+                TotalGpuEnergy_J = $sample.TotalGpuEnergy_J
+            }
+            
+            # Add columns for each process
+            foreach ($procName in $allProcessNames) {
+                $power = if ($sample.ProcessPowers.ContainsKey($procName)) {
+                    $sample.ProcessPowers[$procName]
+                } else {
+                    0.0
+                }
+                $row["${procName}_Power_W"] = $power
+            }
+            
+            $csvRows += [PSCustomObject]$row
+        }
+
+        # Export to CSV
+        $csvRows | Export-Csv -Path $CsvPath -NoTypeInformation -Encoding UTF8
+        Write-Host "Per-sample CSV report written to: $CsvPath" -ForegroundColor Green
+    }
 }
 
 # ---- main ----
@@ -268,13 +377,8 @@ Power Attribution Formula:
 Process_Weighted_Util = (SM × $WeightSM) + (Mem × $WeightMem) + (Enc × $WeightEnc) + (Dec × $WeightDec)
 Process_Power = (Idle_Power / N_processes) + (Process_Weighted_Util / Total_Weighted_Util) × Active_Power
 
-Example Workloads:
-- Gaming: High SM, moderate Mem, low Enc/Dec
-- Streaming: Moderate SM, high Enc, low Dec
-- Video Playback: Low SM, high Dec, low Enc
-- Video Export: High SM + Enc depending on codec
-
 "@
 
 $monitor = [GPUMultiMetricMonitor]::new($WeightSM, $WeightMem, $WeightEnc, $WeightDec)
 $monitor.Run($Duration, $SampleInterval, $Process)
+$monitor.WriteCsvReport($Duration, $Process, $CsvOutput)
