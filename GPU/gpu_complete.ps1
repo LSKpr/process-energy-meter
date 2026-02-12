@@ -1,3 +1,8 @@
+<#
+Usage example:
+.\gpu_complete.ps1 -Process "myapp" -Duration 60 -SampleInterval 100 -WeightSm 1.0 -WeightMem 0.5 -WeightEnc 0.25 -WeightDec 0.15 -AutoScale -Diagnostics
+#>
+
 param(
     [string]$Process = $null,
     [ValidateRange(1,86400)][int]$Duration = 60,
