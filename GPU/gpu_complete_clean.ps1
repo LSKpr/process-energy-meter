@@ -1,6 +1,15 @@
 <#
 Usage example:
-.\gpu_complete.ps1 -Process "myapp" -Duration 60 -SampleInterval 100 -WeightSm 1.0 -WeightMem 0.5 -WeightEnc 0.25 -WeightDec 0.15 -AutoScale
+For generall monitoring of all GPU processes:
+.\gpu_complete_clean.ps1
+For specific process by name or PID (e.g., "python" or "1234""):
+.\gpu_complete_clean.ps1 -Process "python"
+Other flags of intereset:
+    -Duration: how long to monitor in seconds (default 60)
+    -SampleInterval: how often to sample in ms (default 100)
+    -WeightSM, WeightMem, WeightEnc, WeightDec: weights for the attribution formula (defaults: 1.0, 0.5, 0.25, 0.15)
+    -AutoScale: if set, will scale per-process values to match total GPU energy if there is a significant difference (e.g., due to measurement error)
+    -DiagnosticsOutput: base path for writing diagnostics CSV files (default "gpu_diagnostics")
 #>
 
 param(
