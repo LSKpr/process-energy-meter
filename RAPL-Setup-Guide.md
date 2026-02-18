@@ -38,41 +38,55 @@ Intel RAPL (Running Average Power Limit) allows direct reading of CPU power cons
    sc start WinRing0_1_2_0
    ```
 
-## Building the RAPL Library
+## Using RAPL with LibreHardwareMonitor
 
-1. Open PowerShell **as Administrator**
-2. Navigate to the project folder:
+The current scripts use **LibreHardwareMonitor** for RAPL access, which is simpler than building custom libraries.
+
+1. **Ensure LibreHardwareMonitorLib.dll is present**:
    ```powershell
-   cd "C:\Users\kacpe\Desktop\KTH\AL1523"
+   # Navigate to your script directory
+   cd "<path-to-your-script-directory>"
+   
+   # Check if DLL exists
+   Test-Path .\LibreHardwareMonitorLib.dll
    ```
-3. Run the build script:
-   ```powershell
-   .\Build-MsrReader.ps1
-   ```
-4. Verify `MsrReader.dll` was created
+
+2. **Download if missing**:
+   - Get from: https://github.com/LibreHardwareMonitor/LibreHardwareMonitor/releases
+   - Extract `LibreHardwareMonitorLib.dll` to your script directory
+
+3. **The DLL handles driver installation automatically** when run as Administrator
 
 ## Running with RAPL Support
 
 ```powershell
 # Run as Administrator
-.\ProcessPowerMeter-Enhanced.ps1
+.\ProcessPowerMeter-Interactive.ps1
+# Or any other script that uses RAPL
 ```
 
-The script will:
-- ✓ Auto-detect RAPL support
-- ✓ Use CPU-only power if available
-- ✓ Fall back to system power if RAPL unavailable
+The scripts will:
+- ✓ Auto-detect RAPL support via LibreHardwareMonitor
+- ✓ Initialize hardware monitoring and CPU sensors
+- ✓ Read CPU package power directly from RAPL registers
+- ✓ Fall back gracefully if RAPL unavailable
+- ✓ Show clear error messages if hardware/drivers not accessible
 
 ## Verification
 
 To check if RAPL is working:
 
 ```powershell
-Add-Type -Path ".\MsrReader.dll"
-$monitor = New-Object PowerMeter.RaplPowerMonitor
-$monitor.IsSupported  # Should return True
-$monitor.GetPackagePower()  # Should return CPU power in Watts
+# Run the test script as Administrator
+.\prototypes\Test-LibreHardwareMonitor.ps1
 ```
+
+This will:
+- Initialize LibreHardwareMonitor
+- Detect your CPU
+- List all available sensors
+- Show current CPU package power reading
+- Confirm RAPL is functioning correctly
 
 ## Troubleshooting
 
@@ -86,13 +100,15 @@ $monitor.GetPackagePower()  # Should return CPU power in Watts
 - Try running OpenHardwareMonitor first
 - Check Windows Event Viewer for driver errors
 
-### "MsrReader.dll not found"
-- Run `.\Build-MsrReader.ps1` first
-- Verify .NET Framework is installed
+### "LibreHardwareMonitorLib.dll not found"
+- Download from: https://github.com/LibreHardwareMonitor/LibreHardwareMonitor/releases
+- Place `LibreHardwareMonitorLib.dll` in the same directory as the scripts
+- Verify .NET Framework 4.x is installed (usually pre-installed on Windows 10/11)
 
 ### Still not working?
-- Use the original script: `.\ProcessPowerMeter.ps1`
-- It uses system-wide power measurement (still functional)
+- Use the basic script: `.\prototypes\ProcessPowerMeter.ps1`
+- It uses system-wide Power Meter counters (no RAPL required)
+- Works on any system without special privileges
 
 ## What RAPL Measures
 

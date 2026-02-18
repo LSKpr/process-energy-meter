@@ -7,3 +7,8 @@ MsrReader.dll
 # Library folders
 LibreHardwareMonitor/
 LibreRelease/
+
+# Intel PCM binaries (download separately)
+pcm/
+pcm-*.exe
+*.sys
