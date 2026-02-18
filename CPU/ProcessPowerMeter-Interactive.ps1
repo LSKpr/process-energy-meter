@@ -110,12 +110,11 @@ function Get-ProcessCpuUtilization {
                 continue
             }
             
-            # Optimization: Avoid ContainsKey check
-            if ($null -eq $processData[$processName]) {
-                $processData[$processName] = $cpuPercent
+            if ($processData.ContainsKey($processName)) {
+                $processData[$processName] += $cpuPercent
             }
             else {
-                $processData[$processName] += $cpuPercent
+                $processData[$processName] = $cpuPercent
             }
             
             $totalCpu += $cpuPercent
@@ -231,9 +230,6 @@ function Update-ProcessEnergyData {
     
     $totalCpu = $cpuData.TotalCpu
     
-    # Optimization: Pre-calculate system power flag outside loop
-    $hasSystemPower = ($null -ne $systemPowerMilliwatts)
-    
     if ($totalCpu -gt 0) {
         foreach ($process in $cpuData.ProcessData.GetEnumerator()) {
             $processName = $process.Key
@@ -243,10 +239,11 @@ function Update-ProcessEnergyData {
             $processPowerCpu = $cpuPowerMilliwatts * $cpuRatio
             $energyCpu = $processPowerCpu * $IntervalSeconds
             
-            # Optimization: Simplified system power calculation
-            $energySystem = if ($hasSystemPower) {
-                $systemPowerMilliwatts * $cpuRatio * $IntervalSeconds
-            } else { 0 }
+            $energySystem = 0
+            if ($null -ne $systemPowerMilliwatts) {
+                $processPowerSystem = $systemPowerMilliwatts * $cpuRatio
+                $energySystem = $processPowerSystem * $IntervalSeconds
+            }
             
             if (-not $script:ProcessEnergyData.ContainsKey($processName)) {
                 $script:ProcessEnergyData[$processName] = @{
@@ -258,18 +255,16 @@ function Update-ProcessEnergyData {
                 }
             }
             
-            # Optimization: Cache hashtable lookup
-            $data = $script:ProcessEnergyData[$processName]
-            $data.CpuEnergy += $energyCpu
-            $data.SystemEnergy += $energySystem
-            $data.LastSeenCpu = $processCpu
-            $data.LastSeenPowerMw = $processPowerCpu
+            $script:ProcessEnergyData[$processName].CpuEnergy += $energyCpu
+            $script:ProcessEnergyData[$processName].SystemEnergy += $energySystem
+            $script:ProcessEnergyData[$processName].LastSeenCpu = $processCpu
+            $script:ProcessEnergyData[$processName].LastSeenPowerMw = $processPowerCpu
             
-            # Optimization: Batch remove old history items for better performance
-            if ($data.PowerHistory.Count -ge $script:MaxHistorySize) {
-                $data.PowerHistory.RemoveRange(0, 10)
+            # Add to power history
+            if ($script:ProcessEnergyData[$processName].PowerHistory.Count -ge $script:MaxHistorySize) {
+                $script:ProcessEnergyData[$processName].PowerHistory.RemoveAt(0)
             }
-            $null = $data.PowerHistory.Add($processPowerCpu)
+            $null = $script:ProcessEnergyData[$processName].PowerHistory.Add($processPowerCpu)
         }
     }
     
@@ -627,12 +622,7 @@ function Start-CommandLineMode {
                 }
             }
             
-            # Optimization: Adaptive sleep - reduce CPU usage during idle
-            $timeUntilNextUpdate = $script:MeasurementInterval - ($now - $lastDataUpdate).TotalSeconds
-            $timeUntilNextDisplay = 2 - ($now - $lastDisplayRefresh).TotalSeconds
-            $minTime = [Math]::Min($timeUntilNextUpdate, $timeUntilNextDisplay)
-            $sleepMs = [Math]::Max(50, [Math]::Min(500, $minTime * 1000))
-            Start-Sleep -Milliseconds $sleepMs
+            Start-Sleep -Milliseconds 100
         }
     }
     finally {
