@@ -1,9 +1,6 @@
 <#
 Usage example:
-For general monitoring of all GPU processes:
 .\gpu_final.ps1
-For specific process by name or procId (e.g., "python" or "1234"):
-.\gpu_final.ps1 -Process "python"
 Other flags of interest:
     -Duration: how long to monitor in seconds (default 60)
     -SampleInterval: how often to sample in ms (default 100)
@@ -49,6 +46,14 @@ class GPUProcessMonitor {
     [hashtable]$GpuIdleProcesses
     [int]$IdleProcessCount
     [string]$DiagnosticsOutputPath
+    [System.Collections.Generic.Dictionary[int,string]] $ProcessNameCache
+    [System.Collections.Generic.LinkedList[int]] $ProcessNameCacheOrder
+    [int] $ProcessNameCacheCapacity
+    [System.IO.StreamWriter] $SamplesCsvWriter
+    [System.IO.StreamWriter] $ProcessesCsvWriter
+    [int] $SamplesSinceLastFlush
+    [int] $SamplesFlushInterval
+    [int] $MaxSamplesInMemory
 
     GPUProcessMonitor([int]$SampleIntervalMs, [double]$wSM, [double]$wMem, [double]$wEnc, [double]$wDec, [string]$diagPath) {
         $this.SampleIntervalMs = $SampleIntervalMs
@@ -66,21 +71,81 @@ class GPUProcessMonitor {
         $this.GpuIdleProcesses = @{}
         $this.DiagnosticsOutputPath = $diagPath
 
+        # initialize LRU cache defaults
+        $this.ProcessNameCache = $null
+        $this.ProcessNameCacheOrder = $null
+        $this.ProcessNameCacheCapacity = 1024       # default capacity
+
+        # writer flush tuning
+        $this.SamplesSinceLastFlush = 0
+        $this.SamplesFlushInterval = 10   # flush every 10 samples
+
+        # long-run safety: cap in-memory samples
+        $this.MaxSamplesInMemory = 10000  # default; adjust if you want to keep more samples in memory
+
         # Get GPU name
         $gpuNameOutput = nvidia-smi --query-gpu=name --format=csv,noheader 2>$null
-        $this.GpuName = $gpuNameOutput.Trim()
-        Write-Log "Monitoring GPU: $($this.GpuName)"
+        $this.GpuName = if ($gpuNameOutput) { $gpuNameOutput.Trim() } else { "unknown" }
+        Write-Log("Monitoring GPU: $($this.GpuName)")
         Write-Host "Power attribution weights: SM=$wSM, Mem=$wMem, Enc=$wEnc, Dec=$wDec"
 
         # Measure idle metrics
-        Write-Log "Measuring idle power (please ensure GPU is idle; close heavy apps)."
+        Write-Log("Measuring idle power (please ensure GPU is idle; close heavy apps).")
         $this.MeasureIdleMetrics()
-        Write-Log (("Idle GPU power measured: {0:N2}W [Min: {1:N2}W  Max:{2:N2}W] with {3} Processes; Temp: {4:F1}C  Fan: {5:F1}%" -f `
+        Write-Log(("Idle GPU power measured: {0:N2}W [Min: {1:N2}W  Max:{2:N2}W] with {3} Processes; Temp: {4:F1}C  Fan: {5:F1}%" -f `
             $this.GpuIdlePower, $this.GpuIdlePowerMin, $this.GpuIdlePowerMax, $this.IdleProcessCount, $this.GpuIdleTemperatureC, $this.GpuIdleFanPercent))
+
+        # Setup diagnostics paths and open writers immediately (header creation happens here)
+        try {
+            $timestampForFile = $this.TimeStampLogging.ToString('yyyyMMdd_HHmmss')
+            $outSpec = $this.DiagnosticsOutputPath
+            if (-not $outSpec) {
+                $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+                $outSpec = Join-Path $scriptDir 'gpu_diagnostics'
+            }
+
+            if ($outSpec -match '\.csv$') {
+                $csvPath = $outSpec
+                $csvPathProcesses = $outSpec -replace '\.csv$','_processes.csv'
+                $diagDir = Split-Path -Parent $csvPath
+                if ($diagDir -and -not (Test-Path $diagDir)) { New-Item -ItemType Directory -Path $diagDir -Force | Out-Null }
+            } else {
+                $diagDir = $outSpec
+                if (-not (Test-Path $diagDir)) { New-Item -ItemType Directory -Path $diagDir -Force | Out-Null }
+                $csvPath = Join-Path $diagDir ("samples_$timestampForFile.csv")
+                $csvPathProcesses = Join-Path $diagDir ("processes_$timestampForFile.csv")
+            }
+
+            # Use FileStream with FileShare.Read so other tools can read while we append (robust for long runs)
+            $needHeaderSamples = -not (Test-Path $csvPath)
+            $fsSamples = [System.IO.FileStream]::new($csvPath, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::Read)
+            # Seek to end for append
+            $fsSamples.Seek(0, [System.IO.SeekOrigin]::End) | Out-Null
+            $this.SamplesCsvWriter = [System.IO.StreamWriter]::new($fsSamples, [System.Text.Encoding]::UTF8)
+            $this.SamplesCsvWriter.AutoFlush = $false
+            if ($needHeaderSamples -and ($fsSamples.Length -eq 0)) {
+                $this.SamplesCsvWriter.WriteLine('Timestamp,PowerW,ActivePowerW,ExcessPowerW,GpuSMUtil,GpuMemUtil,GpuEncUtil,GpuDecUtil,GpuWeightTotal,ProcessWeightTotal,ProcessCount,AttributedPowerW,ResidualPowerW,AccumulatedEnergyJ,TemperatureC,FanPercent')
+                $this.SamplesCsvWriter.Flush()
+            }
+
+            $needHeaderProcs = -not (Test-Path $csvPathProcesses)
+            $fsProcs = [System.IO.FileStream]::new($csvPathProcesses, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::Read)
+            $fsProcs.Seek(0, [System.IO.SeekOrigin]::End) | Out-Null
+            $this.ProcessesCsvWriter = [System.IO.StreamWriter]::new($fsProcs, [System.Text.Encoding]::UTF8)
+            $this.ProcessesCsvWriter.AutoFlush = $false
+            if ($needHeaderProcs -and ($fsProcs.Length -eq 0)) {
+                $this.ProcessesCsvWriter.WriteLine('Timestamp,PID,ProcessName,SMUtil,MemUtil,EncUtil,DecUtil,PowerW,EnergyJ,AccumulatedEnergyJ,WeightedUtil,IsIdle')
+                $this.ProcessesCsvWriter.Flush()
+            }
+        } catch {
+            Write-Log("Warning: Could not create diagnostics files in constructor: $($_.Exception.Message)")
+            # If we couldn't open writers here, Sample() will attempt lazy-open -- keep behavior safe
+            $this.SamplesCsvWriter = $null
+            $this.ProcessesCsvWriter = $null
+        }
     }
 
     [void] MeasureIdleMetrics() {
-        # Take multiple samples to get a stable idle measurement using a single batched nvidia-smi call
         $idleTemperatureSamples = @()
         $idleFanUtilSamples = @()
         $idlePowerSamples = @()
@@ -121,81 +186,167 @@ class GPUProcessMonitor {
         }
     }
 
-    # Faster GetGpuProcesses(): compiled regex, List<>, HashSet for PIDs, single Get-Process
+    # ---------- optimized GetGpuProcesses() --------------------------------
     [array] GetGpuProcesses() {
-        $processList = @()
+        if ($null -eq $this.ProcessNameCache) {
+            $this.ProcessNameCache = [System.Collections.Generic.Dictionary[int,string]]::new()
+            $this.ProcessNameCacheOrder = [System.Collections.Generic.LinkedList[int]]::new()
+            if ($this.ProcessNameCacheCapacity -le 0) { $this.ProcessNameCacheCapacity = 1024 }
+        }
+
+        $resultList = [System.Collections.Generic.List[object]]::new()
 
         $pmonOutput = nvidia-smi pmon -c 1 2>$null
-        if (-not $pmonOutput) { return $processList }
+        if (-not $pmonOutput) { return $resultList.ToArray() }
 
-        $parsed = @()
+        $pmonPattern = '^\s*(\d+)\s+(\d+)\s+([A-Z+]+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(.+?)\s*$'
+        $pmonRegex = [System.Text.RegularExpressions.Regex]::new($pmonPattern, [System.Text.RegularExpressions.RegexOptions]::Compiled)
+
+        $rawEntries = [System.Collections.Generic.List[object]]::new()
+        $pidHash = [System.Collections.Generic.HashSet[int]]::new()
+
         foreach ($line in ($pmonOutput -split "`n")) {
-            if ($line -match '^\s*#' -or $line -match '^-+' -or [string]::IsNullOrWhiteSpace($line)) { continue }
-            if ($line -match '^\s*(\d+)\s+(\d+)\s+([A-Z+]+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(.+?)\s*$') {
-                $parsed += [PSCustomObject]@{
-                    ProcessId = [int]$Matches[2]
-                    SmUtil    = $this.ParseUtil($Matches[4])
-                    MemUtil   = $this.ParseUtil($Matches[5])
-                    EncUtil   = $this.ParseUtil($Matches[6])
-                    DecUtil   = $this.ParseUtil($Matches[7])
-                    Command   = $Matches[10].Trim()
+            if ([string]::IsNullOrWhiteSpace($line)) { continue }
+            if ($line[0] -eq '#') { continue }
+
+            $m = $pmonRegex.Match($line)
+            if (-not $m.Success) { continue }
+
+            $procIdInt = [int]$m.Groups[2].Value
+
+            [void]$pidHash.Add($procIdInt)
+
+            $rawEntries.Add([PSCustomObject]@{
+                ProcessId = $procIdInt
+                SmUtil    = $this.ParseUtil($m.Groups[4].Value)
+                MemUtil   = $this.ParseUtil($m.Groups[5].Value)
+                EncUtil   = $this.ParseUtil($m.Groups[6].Value)
+                DecUtil   = $this.ParseUtil($m.Groups[7].Value)
+                Command   = $m.Groups[10].Value.Trim()
+            })
+        }
+
+        if ($rawEntries.Count -eq 0) { return $resultList.ToArray() }
+
+        # local references for performance
+        $processNameCacheLocal = $this.ProcessNameCache
+        $processNameCacheOrderLocal = $this.ProcessNameCacheOrder
+        $processNameCacheCapacityLocal = $this.ProcessNameCacheCapacity
+
+        # Build list of PIDs missing from cache
+        $pidsToResolve = [System.Collections.Generic.List[int]]::new()
+        foreach ($pidCandidate in $pidHash) {
+            if (-not $processNameCacheLocal.ContainsKey($pidCandidate)) {
+                $pidsToResolve.Add($pidCandidate)
+            } else {
+                # update LRU position (move to front)
+                try {
+                    $node = $processNameCacheOrderLocal.Find($pidCandidate)
+                    if ($node) {
+                        $processNameCacheOrderLocal.Remove($node)
+                        $processNameCacheOrderLocal.AddFirst($node)
+                    }
+                } catch {}
+            }
+        }
+
+        if ($pidsToResolve.Count -gt 0) {
+            try {
+                $pidArray = $pidsToResolve.ToArray()
+                $winProcs = Get-Process -Id $pidArray -ErrorAction SilentlyContinue
+                foreach ($wp in $winProcs) {
+                    $wpId = [int]$wp.Id
+                    $wpName = $wp.ProcessName
+                    if (-not $processNameCacheLocal.ContainsKey($wpId)) {
+                        $processNameCacheLocal.Add($wpId, $wpName)
+                        $processNameCacheOrderLocal.AddFirst($wpId)
+                        while ($processNameCacheOrderLocal.Count -gt $processNameCacheCapacityLocal) {
+                            $lastNode = $processNameCacheOrderLocal.Last
+                            if ($lastNode) {
+                                $oldPid = [int]$lastNode.Value
+                                $processNameCacheOrderLocal.RemoveLast()
+                                if ($processNameCacheLocal.ContainsKey($oldPid)) { $processNameCacheLocal.Remove($oldPid) }
+                            } else { break }
+                        }
+                    } else {
+                        $existingNode = $processNameCacheOrderLocal.Find($wpId)
+                        if ($existingNode) {
+                            $processNameCacheOrderLocal.Remove($existingNode)
+                            $processNameCacheOrderLocal.AddFirst($existingNode)
+                        }
+                    }
                 }
+            } catch {
+                # ignore name resolution failures (best-effort)
             }
         }
 
-        if ($parsed.Count -eq 0) { return $processList }
-
-        # Resolve Windows process names ONCE (same as working version)
-        $procNameMap = @{}
-        $pids = $parsed | Select-Object -ExpandProperty ProcessId -Unique
-        try {
-            $procs = Get-Process -Id $pids -ErrorAction SilentlyContinue
-            foreach ($pr in $procs) {
-                $procNameMap[[int]$pr.Id] = $pr
-            }
-        }
-        catch {}
-
-        foreach ($entry in $parsed) {
-            $procObj = $null
-            if ($procNameMap.ContainsKey($entry.ProcessId)) {
-                $procObj = $procNameMap[$entry.ProcessId]
+        # Build final list (use cached name if present, otherwise fallback to pmon Command)
+        foreach ($entry in $rawEntries) {
+            $resolved = $entry.Command
+            $pidKey = [int]$entry.ProcessId
+            $tmpName = $null
+            if ($processNameCacheLocal.TryGetValue($pidKey, [ref]$tmpName)) {
+                $resolved = $tmpName
+                try {
+                    $node = $processNameCacheOrderLocal.Find($pidKey)
+                    if ($node) {
+                        $processNameCacheOrderLocal.Remove($node)
+                        $processNameCacheOrderLocal.AddFirst($node)
+                    }
+                } catch {}
             }
 
-            $processName = if ($procObj) {
-                $procObj.ProcessName
-            }
-            else {
-                $entry.Command
-            }
-
-            $processList += [PSCustomObject]@{
+            $resultList.Add([PSCustomObject]@{
                 ProcessId    = $entry.ProcessId
-                ProcessName  = [string]$processName
+                ProcessName  = [string]$resolved
                 SmUtil       = $entry.SmUtil
                 MemUtil      = $entry.MemUtil
                 EncUtil      = $entry.EncUtil
                 DecUtil      = $entry.DecUtil
                 WeightedUtil = 0.0
-            }
+            })
         }
 
-        return $processList
+        return $resultList.ToArray()
     }
 
     [double] ParseUtil([string]$value) {
         if ([string]::IsNullOrWhiteSpace($value) -or $value -eq '-') { return 0.0 }
-        if ($value -match '([-+]?[0-9]*\.?[0-9]+)') {
-            try {
-                return [double]$matches[1]
-            }
-            catch {}
+
+        $s = $value.Trim()
+        $s = $s -replace '[^\d\.\-+]',''
+
+        $d = 0.0
+        if ([double]::TryParse($s, [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$d)) {
+            return $d
         }
+
         return 0.0
     }
 
+    # helper to safely flush+close writers (called on exit)
+    [void] CloseWriters() {
+        try {
+            if ($null -ne $this.SamplesCsvWriter) {
+                try { $this.SamplesCsvWriter.Flush() } catch {}
+                try { $this.SamplesCsvWriter.Close() } catch {}
+                $this.SamplesCsvWriter = $null
+            }
+        } catch {}
+
+        try {
+            if ($null -ne $this.ProcessesCsvWriter) {
+                try { $this.ProcessesCsvWriter.Flush() } catch {}
+                try { $this.ProcessesCsvWriter.Close() } catch {}
+                $this.ProcessesCsvWriter = $null
+            }
+        } catch {}
+    }
+
+    # ---------- optimized Sample() ----------------------------------------
     [void] Sample() {
-        # Cache frequently used instance fields locally to avoid repeated property resolution
+        # fast local caches of instance fields (avoid repeated $this. property lookup)
         $weightSmLocal      = $this.WeightSm
         $weightMemoryLocal  = $this.WeightMemory
         $weightEncoderLocal = $this.WeightEncoder
@@ -203,16 +354,14 @@ class GPUProcessMonitor {
         $gpuIdleProcessMap  = $this.GpuIdleProcesses
         $processEnergyMap   = $this.ProcessEnergyJoules
 
-        # High-resolution monotonic timing (fast path)
+        # timing (hot path)
         $currentTicks = $this.Stopwatch.ElapsedTicks
         $deltaTicks   = $currentTicks - $this.LastSampleTime
         $this.LastSampleTime = $currentTicks
         if ($deltaTicks -le 0) { return }
-
-        # Convert to seconds (double, sub-ms precision)
         $dt = $deltaTicks / $this.StopwatchFrequency
 
-        # Batched nvidia-smi for GPU-wide metrics
+        # GPU-wide metrics (batched)
         $timestamp = "-"
         $gpuPower = 0.0
         $gpuSmUtil = 0.0
@@ -221,7 +370,10 @@ class GPUProcessMonitor {
         $gpuDecUtil = 0.0
         $gpuTemperature = 0.0
         $gpuFanUtil = 0.0
+
+        # Acquire GPU metrics and per-process entries
         $combinedOut = nvidia-smi --query-gpu=timestamp,power.draw.instant,utilization.gpu,utilization.memory,utilization.encoder,utilization.decoder,temperature.gpu,fan.speed --format=csv,noheader,nounits 2>$null
+        $processEntries = $this.GetGpuProcesses()
         $parts = $combinedOut -split ',\s*'
         if ($parts.Count -ge 8) {
             try {
@@ -233,39 +385,35 @@ class GPUProcessMonitor {
                 $gpuDecUtil = [double]$parts[5].Trim()
                 $gpuTemperature = [double]$parts[6].Trim()
                 $gpuFanUtil = [double]$parts[7].Trim()
-            }
-            catch {}
+            } catch {}
         }
-
-        # Get running processes with their utilizations (fast)
-        $processEntries = $this.GetGpuProcesses()
         $currentProcessCount = $processEntries.Count
 
-        # Compute weighted GPU total
+        # weighted GPU total
         $gpuWeightedTotal = ($weightSmLocal * $gpuSmUtil) +
                             ($weightMemoryLocal * $gpuMemUtil) +
                             ($weightEncoderLocal * $gpuEncUtil) +
                             ($weightDecoderLocal * $gpuDecUtil)
 
-        # Per-process weighted totals
+        # per-process weighted totals
         $processWeightTotal = 0.0
         $inactiveIdleProcessesCount = 0
         foreach ($processEntry in $processEntries) {
             $weightedValue = ($weightSmLocal * $processEntry.SmUtil) +
-                             ($weightMemoryLocal * $processEntry.MemUtil) +
-                             ($weightEncoderLocal * $processEntry.EncUtil) +
-                             ($weightDecoderLocal * $processEntry.DecUtil)
+                            ($weightMemoryLocal * $processEntry.MemUtil) +
+                            ($weightEncoderLocal * $processEntry.EncUtil) +
+                            ($weightDecoderLocal * $processEntry.DecUtil)
             $processEntry.WeightedUtil = $weightedValue
             $processWeightTotal += $weightedValue
 
             $processIdStringForLookup = $processEntry.ProcessId.ToString()
-            $isIdleProcessFlag = $gpuIdleProcessMap.ContainsKey($processIdStringForLookup)
-            if ($weightedValue -le 0 -and $isIdleProcessFlag) {
+            $isIdleLookup = $gpuIdleProcessMap.ContainsKey($processIdStringForLookup)
+            if ($weightedValue -le 0 -and $isIdleLookup) {
                 $inactiveIdleProcessesCount++
             }
         }
 
-        # Attribution math (unchanged)
+        # attribution math
         $gpuActivePower = if (($this.GpuIdlePower) -lt $gpuPower) { $gpuPower - ($this.GpuIdlePower) } else { 0 }
         $gpuTotalProcessUtil = if ($gpuWeightedTotal -gt 0) { $processWeightTotal / $gpuWeightedTotal } else { 0 }
         $gpuTotalActiveProcessPower = $gpuTotalProcessUtil * $gpuActivePower
@@ -275,266 +423,300 @@ class GPUProcessMonitor {
         $P_idle_pwr = if ($this.IdleProcessCount -gt 0) { $this.GpuIdlePower / $this.IdleProcessCount } else { 0 }
         $P_residual_per_proc = if ($activeProcessCount -gt 0) { $gpuExcessPower / $activeProcessCount } else { 0 }
 
-        # Build per-process attribution objects quickly
+        # per-process attribution objects
         $sampleAttributedPower = 0.0
-        $samplePerProcess = @{}
+        $samplePerProcess = @{ }
+
+        # Precompute culture once
+        $inv = [System.Globalization.CultureInfo]::InvariantCulture
+
+        # Precompute timestamp sanitized once
+        $tsEsc_local = ($timestamp -replace '"','""')
+
         foreach ($processEntry in $processEntries) {
             $processIdString = $processEntry.ProcessId.ToString()
             $weightedForThisProcess = $processEntry.WeightedUtil
 
             if ($processWeightTotal -le 0) { $fraction = 0 } else { $fraction = $weightedForThisProcess / $processWeightTotal }
 
-            if ($gpuIdleProcessMap.ContainsKey($processIdString)) {
+            $isIdleThisProcess = $gpuIdleProcessMap.ContainsKey($processIdString)
+            if ($isIdleThisProcess) {
                 if ($weightedForThisProcess -le 0) {
                     $powerValue = if ($inactiveIdleProcessesCount -eq $currentProcessCount) { $P_idle_pwr + $P_residual_per_proc } else { $P_idle_pwr }
-                }
-                else {
+                } else {
                     $powerValue = $P_idle_pwr + ($fraction * $gpuTotalActiveProcessPower) + $P_residual_per_proc
                 }
-            }
-            else {
+            } else {
                 if ($weightedForThisProcess -le 0) {
                     $powerValue = $P_residual_per_proc
-                }
-                else {
+                } else {
                     $powerValue = ($fraction * $gpuTotalActiveProcessPower) + $P_residual_per_proc
                 }
             }
 
             $energyJ = $powerValue * $dt
 
-            # safe and faster update of ProcessEnergyJoules
+            # update ProcessEnergyJoules safely and quickly (strings as keys)
             if ($processEnergyMap.ContainsKey($processIdString)) {
                 $existingEnergyValue = [double]$processEnergyMap[$processIdString]
             } else {
                 $existingEnergyValue = 0.0
             }
-            $processEnergyMap[$processIdString] = $existingEnergyValue + $energyJ
+            $accumulatedProcessEnergy = $existingEnergyValue + $energyJ
+            $processEnergyMap[$processIdString] = $accumulatedProcessEnergy
 
             $sampleAttributedPower += $powerValue
 
+            # build per-process PSCustomObject with raw numeric values (rounding only at logging)
             $samplePerProcess[$processIdString] = [PSCustomObject]@{
-                PID          = $processIdString
-                ProcessName  = [string]$processEntry.ProcessName
-                SMUtil       = $processEntry.SmUtil
-                MemUtil      = $processEntry.MemUtil
-                EncUtil      = $processEntry.EncUtil
-                DecUtil      = $processEntry.DecUtil
-                PowerW       = [math]::Round($powerValue, 4)
-                EnergyJ      = [math]::Round($energyJ, 6)
-                WeightedUtil = $weightedForThisProcess
-                IsIdle       = [bool]$gpuIdleProcessMap.ContainsKey($processIdString)
+                PID                       = $processIdString
+                ProcessName               = [string]$processEntry.ProcessName
+                SMUtil                    = $processEntry.SmUtil
+                MemUtil                   = $processEntry.MemUtil
+                EncUtil                   = $processEntry.EncUtil
+                DecUtil                   = $processEntry.DecUtil
+                PowerW                    = $powerValue
+                EnergyJ                   = $energyJ
+                AccumulatedProcessEnergyJ = $accumulatedProcessEnergy
+                WeightedUtil              = $weightedForThisProcess
+                IsIdle                    = $isIdleThisProcess
             }
         }
 
-        # Record sample
+        # record sample in memory
         $this.GpuEnergyJoules += ($gpuPower * $dt)
+        $accumulatedEnergy = $this.GpuEnergyJoules
         $sampleResidualPower = $gpuPower - $sampleAttributedPower
-        [void]$this.Samples.Add([PSCustomObject]@{
-                Timestamp         = $timestamp
-                PowerW            = $gpuPower
-                ActivePowerW      = $gpuActivePower
-                ExcessPowerW      = $gpuExcessPower
-                GpuSmUtil         = $gpuSmUtil
-                GpuMemUtil        = $gpuMemUtil
-                GpuEncUtil        = $gpuEncUtil
-                GpuDecUtil        = $gpuDecUtil
-                GpuWeightedTotal  = $gpuWeightedTotal
-                ProcessWeightTotal= $processWeightTotal
-                ProcessCount      = $currentProcessCount
-                AttributedPowerW  = [math]::Round($sampleAttributedPower, 4)
-                ResidualPowerW    = [math]::Round($sampleResidualPower, 4)
-                TemperatureC      = $gpuTemperature
-                FanPercent        = $gpuFanUtil
-                PerProcess        = $samplePerProcess
-            })
 
-        # --- Real-time diagnostics logging (append-only, per-sample) -------------
+        # Add sample to in-memory list and enforce memory cap (avoid unbounded growth during very long runs)
+        $sampleObj = [PSCustomObject]@{
+            Timestamp          = $timestamp
+            PowerW             = $gpuPower
+            ActivePowerW       = $gpuActivePower
+            ExcessPowerW       = $gpuExcessPower
+            GpuSmUtil          = $gpuSmUtil
+            GpuMemUtil         = $gpuMemUtil
+            GpuEncUtil         = $gpuEncUtil
+            GpuDecUtil         = $gpuDecUtil
+            GpuWeightedTotal   = $gpuWeightedTotal
+            ProcessWeightTotal = $processWeightTotal
+            ProcessCount       = $currentProcessCount
+            AttributedPowerW   = $sampleAttributedPower
+            ResidualPowerW     = $sampleResidualPower
+            AccumulatedEnergyJ = $accumulatedEnergy
+            TemperatureC       = $gpuTemperature
+            FanPercent         = $gpuFanUtil
+            PerProcess         = $samplePerProcess
+        }
+
+        [void]$this.Samples.Add($sampleObj)
+
+        # enforce in-memory cap
         try {
-            # mirror Report() behavior for paths
-            $timestampForFile = $this.TimeStampLogging.ToString('yyyyMMdd_HHmmss')
-            $outSpec = $this.DiagnosticsOutputPath
+            if ($this.Samples.Count -gt $this.MaxSamplesInMemory) {
+                $removeCount = $this.Samples.Count - $this.MaxSamplesInMemory
+                # RemoveRange exists on List<T>
+                $this.Samples.RemoveRange(0, $removeCount)
+            }
+        } catch {}
 
-            if (-not $outSpec) {
-                $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
-                $outSpec = Join-Path $scriptDir 'gpu_diagnostics'
+        # ---------- realtime CSV logging (cached writers & batched flush) ----------
+        try {
+            # Writers were created in constructor where possible; Sample() will fall back to lazy open if necessary
+            if ($null -eq $this.SamplesCsvWriter -or $this.SamplesCsvWriter.BaseStream -eq $null) {
+                # lazy-open (same logic as constructor) - rarely runs since constructor tries to open
+                $timestampForFile = $this.TimeStampLogging.ToString('yyyyMMdd_HHmmss')
+                $outSpec = $this.DiagnosticsOutputPath
+                if (-not $outSpec) {
+                    $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+                    $outSpec = Join-Path $scriptDir 'gpu_diagnostics'
+                }
+
+                if ($outSpec -match '\.csv$') {
+                    $csvPath = $outSpec
+                    $csvPathProcesses = $outSpec -replace '\.csv$','_processes.csv'
+                    $diagDir = Split-Path -Parent $csvPath
+                    if ($diagDir -and -not (Test-Path $diagDir)) { New-Item -ItemType Directory -Path $diagDir -Force | Out-Null }
+                } else {
+                    $diagDir = $outSpec
+                    if (-not (Test-Path $diagDir)) { New-Item -ItemType Directory -Path $diagDir -Force | Out-Null }
+                    $csvPath = Join-Path $diagDir ("samples_$timestampForFile.csv")
+                    $csvPathProcesses = Join-Path $diagDir ("processes_$timestampForFile.csv")
+                }
+
+                $needHeader = -not (Test-Path $csvPath)
+                $fsSamples = [System.IO.FileStream]::new($csvPath, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::Read)
+                $fsSamples.Seek(0, [System.IO.SeekOrigin]::End) | Out-Null
+                $this.SamplesCsvWriter = [System.IO.StreamWriter]::new($fsSamples, [System.Text.Encoding]::UTF8)
+                $this.SamplesCsvWriter.AutoFlush = $false
+                if ($needHeader -and ($fsSamples.Length -eq 0)) {
+                    $this.SamplesCsvWriter.WriteLine('Timestamp,PowerW,ActivePowerW,ExcessPowerW,GpuSMUtil,GpuMemUtil,GpuEncUtil,GpuDecUtil,GpuWeightTotal,ProcessWeightTotal,ProcessCount,AttributedPowerW,ResidualPowerW,AccumulatedEnergyJ,TemperatureC,FanPercent')
+                }
             }
 
-            if ($outSpec -match '\.csv$') {
-                $csvPath = $outSpec
-                $csvPathProcesses = $outSpec -replace '\.csv$','_processes.csv'
-                $diagDir = Split-Path -Parent $csvPath
-                if ($diagDir -and -not (Test-Path $diagDir)) { New-Item -ItemType Directory -Path $diagDir -Force | Out-Null }
+            # write sample line (single concatenated string) — round here only
+            $line = '"' + $tsEsc_local + '",' +
+                    ([double]$gpuPower).ToString('F4', $inv) + ',' +
+                    ([double]$gpuActivePower).ToString('F4', $inv) + ',' +
+                    ([double]$gpuExcessPower).ToString('F4', $inv) + ',' +
+                    ([double]$gpuSmUtil).ToString('F2', $inv) + ',' +
+                    ([double]$gpuMemUtil).ToString('F2', $inv) + ',' +
+                    ([double]$gpuEncUtil).ToString('F2', $inv) + ',' +
+                    ([double]$gpuDecUtil).ToString('F2', $inv) + ',' +
+                    ([double]$gpuWeightedTotal).ToString('F2', $inv) + ',' +
+                    ([double]$processWeightTotal).ToString('F2', $inv) + ',' +
+                    [int]$currentProcessCount + ',' +
+                    ([double]$sampleAttributedPower).ToString('F6', $inv) + ',' +
+                    ([double]$sampleResidualPower).ToString('F6', $inv) + ',' +
+                    ([double]$accumulatedEnergy).ToString('F8', $inv) + ',' +
+                    ([double]$gpuTemperature).ToString('F1', $inv) + ',' +
+                    ([double]$gpuFanUtil).ToString('F1', $inv)
+
+            $this.SamplesCsvWriter.WriteLine($line)
+
+            # open and cache per-process writer if missing
+            if ($null -eq $this.ProcessesCsvWriter -or $this.ProcessesCsvWriter.BaseStream -eq $null) {
+                $timestampForFile = $this.TimeStampLogging.ToString('yyyyMMdd_HHmmss')
+                $outSpec = $this.DiagnosticsOutputPath
+                if (-not $outSpec) {
+                    $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+                    $outSpec = Join-Path $scriptDir 'gpu_diagnostics'
+                }
+
+                if ($outSpec -match '\.csv$') {
+                    $csvPathProcesses = $outSpec -replace '\.csv$','_processes.csv'
+                } else {
+                    $diagDir = $outSpec
+                    $csvPathProcesses = Join-Path $diagDir ("processes_$timestampForFile.csv")
+                }
+
+                $needHeaderProc = -not (Test-Path $csvPathProcesses)
+                $fsProcs = [System.IO.FileStream]::new($csvPathProcesses, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::Read)
+                $fsProcs.Seek(0, [System.IO.SeekOrigin]::End) | Out-Null
+                $this.ProcessesCsvWriter = [System.IO.StreamWriter]::new($fsProcs, [System.Text.Encoding]::UTF8)
+                $this.ProcessesCsvWriter.AutoFlush = $false
+                if ($needHeaderProc -and ($fsProcs.Length -eq 0)) {
+                    $this.ProcessesCsvWriter.WriteLine('Timestamp,PID,ProcessName,SMUtil,MemUtil,EncUtil,DecUtil,PowerW,EnergyJ,AccumulatedEnergyJ,WeightedUtil,IsIdle')
+                }
             }
-            else {
-                $diagDir = $outSpec
-                if (-not (Test-Path $diagDir)) { New-Item -ItemType Directory -Path $diagDir -Force | Out-Null }
-                $csvPath = Join-Path $diagDir ("samples_$timestampForFile.csv")
-                $csvPathProcesses = Join-Path $diagDir ("processes_$timestampForFile.csv")
+
+            # write per-process lines (round here)
+            foreach ($perProcessEntry in $samplePerProcess.Values) {
+                $pnameEsc = ($perProcessEntry.ProcessName -replace '"','""') -replace '\r|\n',' '
+                $line2 = '"' + $tsEsc_local + '",' +
+                        $perProcessEntry.PID + ',"' + $pnameEsc + '",' +
+                        ([double]$perProcessEntry.SMUtil).ToString('F2', $inv) + ',' +
+                        ([double]$perProcessEntry.MemUtil).ToString('F2', $inv) + ',' +
+                        ([double]$perProcessEntry.EncUtil).ToString('F2', $inv) + ',' +
+                        ([double]$perProcessEntry.DecUtil).ToString('F2', $inv) + ',' +
+                        ([double]$perProcessEntry.PowerW).ToString('F6', $inv) + ',' +
+                        ([double]$perProcessEntry.EnergyJ).ToString('F8', $inv) + ',' +
+                        ([double]$perProcessEntry.AccumulatedProcessEnergyJ).ToString('F8', $inv) + ',' +
+                        ([double]$perProcessEntry.WeightedUtil).ToString('F4', $inv) + ',' +
+                        ([bool]$perProcessEntry.IsIdle).ToString()
+                $this.ProcessesCsvWriter.WriteLine($line2)
             }
 
-            # prepare invariant culture for number formatting
-            $inv = [System.Globalization.CultureInfo]::InvariantCulture
-
-            # prepare sample-line values (escape quotes in timestamp)
-            $tsEsc = ($timestamp -replace '"','""')
-            $pw   = ([double]$gpuPower).ToString('F4', $inv)
-            $act  = ([double]$gpuActivePower).ToString('F4', $inv)
-            $ex   = ([double]$gpuExcessPower).ToString('F4', $inv)
-            $sm   = ([double]$gpuSmUtil).ToString('F2', $inv)
-            $mem  = ([double]$gpuMemUtil).ToString('F2', $inv)
-            $enc  = ([double]$gpuEncUtil).ToString('F2', $inv)
-            $dec  = ([double]$gpuDecUtil).ToString('F2', $inv)
-            $gwt  = ([double]$gpuWeightedTotal).ToString('F2', $inv)
-            $pwt  = ([double]$processWeightTotal).ToString('F2', $inv)
-            $pc   = [int]$currentProcessCount
-            $apow = ([double]$sampleAttributedPower).ToString('F4', $inv)
-            $rpow = ([double]$sampleResidualPower).ToString('F4', $inv)
-            $tmpC = ([double]$gpuTemperature).ToString('F1', $inv)
-            $fanP = ([double]$gpuFanUtil).ToString('F1', $inv)
-
-            # write sample CSV (append, create header if needed)
-            $writeHeaderSample = -not (Test-Path $csvPath)
-            $sw = [System.IO.StreamWriter]::new($csvPath, $true, [System.Text.Encoding]::UTF8)
-            try {
-                if ($writeHeaderSample) {
-                    $sw.WriteLine('Timestamp,PowerW,ActivePowerW,ExcessPowerW,GpuSMUtil,GpuMemUtil,GpuEncUtil,GpuDecUtil,GpuWeightTotal,ProcessWeightTotal,ProcessCount,AttributedPowerW,ResidualPowerW,TemperatureC,FanPercent')
-                }
-                $line = '"' + $tsEsc + '",' +
-                        $pw  + ',' +
-                        $act + ',' +
-                        $ex  + ',' +
-                        $sm  + ',' +
-                        $mem + ',' +
-                        $enc + ',' +
-                        $dec + ',' +
-                        $gwt + ',' +
-                        $pwt + ',' +
-                        $pc  + ',' +
-                        $apow + ',' +
-                        $rpow + ',' +
-                        $tmpC + ',' +
-                        $fanP
-                $sw.WriteLine($line)
-            } finally { $sw.Close() }
-
-            # write per-process CSV (append, create header if needed)
-            $writeHeaderProc = -not (Test-Path $csvPathProcesses)
-            $sw2 = [System.IO.StreamWriter]::new($csvPathProcesses, $true, [System.Text.Encoding]::UTF8)
-            try {
-                if ($writeHeaderProc) {
-                    $sw2.WriteLine('Timestamp,PID,ProcessName,SMUtil,MemUtil,EncUtil,DecUtil,PowerW,EnergyJ,WeightedUtil,IsIdle')
-                }
-                foreach ($perProcessEntry in $samplePerProcess.Values) {
-                    $p_tsEsc = ($timestamp -replace '"','""')
-                    $procId = $perProcessEntry.PID
-                    $pnameEsc = ($perProcessEntry.ProcessName -replace '"','""') -replace '\r|\n',' '
-                    $smv = ([double]$perProcessEntry.SMUtil).ToString('F2', $inv)
-                    $memv = ([double]$perProcessEntry.MemUtil).ToString('F2', $inv)
-                    $encv = ([double]$perProcessEntry.EncUtil).ToString('F2', $inv)
-                    $decv = ([double]$perProcessEntry.DecUtil).ToString('F2', $inv)
-                    $pwr = ([double]$perProcessEntry.PowerW).ToString('F4', $inv)
-                    $enj = ([double]$perProcessEntry.EnergyJ).ToString('F6', $inv)
-                    $wut = ([double]$perProcessEntry.WeightedUtil).ToString('F4', $inv)
-                    $idl = [bool]$perProcessEntry.IsIdle
-
-                    $line2 = '"' + $p_tsEsc + '",' +
-                             $procId + ',"' + $pnameEsc + '",' +
-                             $smv + ',' +
-                             $memv + ',' +
-                             $encv + ',' +
-                             $decv + ',' +
-                             $pwr + ',' +
-                             $enj + ',' +
-                             $wut + ',' +
-                             $idl
-                    $sw2.WriteLine($line2)
-                }
-            } finally { $sw2.Close() }
+            # batched flush (reduce I/O churn)
+            $this.SamplesSinceLastFlush += 1
+            if ($this.SamplesSinceLastFlush -ge $this.SamplesFlushInterval) {
+                try {
+                    $this.SamplesCsvWriter.Flush()
+                    $this.ProcessesCsvWriter.Flush()
+                } catch {}
+                $this.SamplesSinceLastFlush = 0
+            }
         }
         catch {
-            # don't throw — real-time logging should not break sampling
-            Write-Log "Realtime CSV logging failed: $($_.Exception.Message)"
+            # do not break sampling
+            Write-Log("Realtime CSV logging failed: $($_.Exception.Message)")
         }
-        # --- end real-time logging ------------------------------------------------
     }
 
-    # Run method: Duration is optional (null = run forever)
+    # Run method with fixed-rate scheduling and safe writer close on exit
     [void] Run([Nullable[int]]$Duration) {
         # Prompt user to start workload
-        Write-Host ""; Write-Log "READY: Start the workload now (e.g., compute or memory workload)."
+        Write-Host ""; Write-Log("READY: Start the workload now.")
         Write-Host "Press ENTER when the workload is running and you want to begin sampling..."
         [void][System.Console]::ReadLine()
 
         # Ensure high-resolution stopwatch is available and warm
         if (-not $this.Stopwatch) {
             $this.Stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-        }
-        else {
+        } else {
             $this.Stopwatch.Restart()
         }
 
-        # Cache frequency for faster conversions in hot path
         if (-not $this.StopwatchFrequency) {
             $this.StopwatchFrequency = [int64][System.Diagnostics.Stopwatch]::Frequency
         }
 
-        # Initialize last-sample ticks for the Sample() method
-        $this.LastSampleTime = $this.Stopwatch.ElapsedTicks
+        # compute interval in ticks
+        $intervalTicks = [int64]([double]$this.SampleIntervalMs * $this.StopwatchFrequency / 1000.0)
+        if ($intervalTicks -le 0) { $intervalTicks = 1 }
 
-        # If Duration provided, compute end ticks; if not, run forever
+        # set initial scheduled tick (first sample scheduled after interval)
+        $this.LastSampleTime = $this.Stopwatch.ElapsedTicks
+        $scheduledTick = $this.LastSampleTime + $intervalTicks
+
+        # duration ticks if provided
         $runForever = $false
         $endTicks = 0
         if ($null -eq $Duration) {
             $runForever = $true
-            Write-Log "Monitoring GPU indefinitely (no duration specified). Use Ctrl+C to stop."
-        }
-        else {
-            # Convert seconds -> ticks (int64)
+            Write-Log("Monitoring GPU indefinitely (no duration specified). Use Ctrl+C to stop.")
+        } else {
             $endTicks = [int64]($Duration * $this.StopwatchFrequency)
-            Write-Log "Monitoring GPU for $Duration seconds..."
-            # Optional: log the expected end time in wall-clock terms
+            Write-Log("Monitoring GPU for $Duration seconds...")
             $endWallClock = (Get-Date).AddSeconds([double]$Duration)
-            Write-Log "End time (wall clock): $endWallClock"
+            Write-Log("End time (wall clock): $endWallClock")
+            # Convert end ticks to absolute stopwatch ticks
+            $endTicks = $this.Stopwatch.ElapsedTicks + $endTicks
         }
 
         $sampleCount = 0
         try {
-            if ($runForever) {
-                while ($true) {
+            while ($runForever -or ($this.Stopwatch.ElapsedTicks -lt $endTicks)) {
+                $now = $this.Stopwatch.ElapsedTicks
+                $remaining = $scheduledTick - $now
+                if ($remaining -le 0) {
+                    # it's time (or past): do sample
                     $this.Sample()
                     $sampleCount++
-                    if ($this.SampleIntervalMs -gt 0) {
-                        Start-Sleep -Milliseconds $this.SampleIntervalMs
-                    }
-                }
-            }
-            else {
-                # Stop when elapsed ticks >= endTicks
-                while ($this.Stopwatch.ElapsedTicks -lt $endTicks) {
-                    $this.Sample()
-                    $sampleCount++
-                    if ($this.SampleIntervalMs -gt 0) {
-                        Start-Sleep -Milliseconds $this.SampleIntervalMs
+
+                    # advance scheduledTick forward to the next future schedule
+                    do {
+                        $scheduledTick += $intervalTicks
+                        $now = $this.Stopwatch.ElapsedTicks
+                    } while ($scheduledTick -le $now)
+                } else {
+                    # sleep most of the remaining time to save CPU; wake a little earlier for accuracy
+                    $remainingMs = [int]([double]$remaining * 1000.0 / $this.StopwatchFrequency)
+                    if ($remainingMs -gt 5) {
+                        Start-Sleep -Milliseconds ($remainingMs - 3)
+                    } else {
+                        # very short remaining time — yield to OS
+                        [System.Threading.Thread]::Sleep(0)
                     }
                 }
             }
         }
         catch [System.Exception] {
-            # Allow Ctrl+C or other termination to bubble, but report gracefully
-            Write-Log "Monitoring stopped: $($_.Exception.Message)"
+            Write-Log("Monitoring stopped: $($_.Exception.Message)")
         }
         finally {
+            # flush and close writers to ensure files are written (Ctrl+C and shutdown)
+            try { $this.CloseWriters() } catch {}
+
             $Duration = $this.Stopwatch.Elapsed.TotalSeconds
-            Write-Log "Collected $sampleCount samples over $Duration seconds."
-            $this.Report($Duration)
+            Write-Log("Collected $sampleCount samples over $Duration seconds.")
+            try { $this.Report($Duration) } catch {}
         }
     }
 
     [void] Report([double]$Duration) {
         Write-Host "`n==== GPU POWER SUMMARY ===="
 
-        # Safe duration for averages
         $safeDuration = if ($Duration -le 0 -or [double]::IsNaN($Duration)) { 1.0 } else { [double]$Duration }
         $avgGpuPower = if ($safeDuration -gt 0) { $this.GpuEnergyJoules / $safeDuration } else { 0.0 }
         Write-Host ("Total GPU - Accumulative: {0,8:F2} J  |  Average: {1,6:F2} W" -f $this.GpuEnergyJoules, $avgGpuPower)
@@ -559,11 +741,10 @@ class GPUProcessMonitor {
             try {
                 $procs = Get-Process -Id $allPids -ErrorAction SilentlyContinue
                 foreach ($pr in $procs) { $pidToName[[int]$pr.Id] = $pr.ProcessName }
-            } catch { }
+            } catch {}
         }
 
         # Fallback: if Get-Process didn't return a name (process ended), try to obtain the name
-        # from recorded samples' PerProcess entries (first seen name wins).
         if ($allPids.Count -gt 0) {
             foreach ($procId in $allPids) {
                 if (-not $pidToName.ContainsKey($procId)) {
@@ -590,10 +771,10 @@ class GPUProcessMonitor {
         if ($sumTotalProcessesEnergy -gt 0) {
             $diff = [math]::Abs([double]$this.GpuEnergyJoules - $sumTotalProcessesEnergy)
             $diffPct = if ($this.GpuEnergyJoules -gt 0) { 100.0 * $diff / $this.GpuEnergyJoules } else { 0.0 }
-            Write-Log ("DIAGNOSTIC: Measured total {0:F2} J vs summed attributed {1:F2} J -> Diff: {2:F2} J ({3:F1}%)" -f $this.GpuEnergyJoules, $sumTotalProcessesEnergy, $diff, $diffPct)
+            Write-Log("DIAGNOSTIC: Measured total {0:F2} J vs summed attributed {1:F2} J -> Diff: {2:F2} J ({3:F1}%)" -f $this.GpuEnergyJoules, $sumTotalProcessesEnergy, $diff, $diffPct)
         }
 
-        # Aggregate by process name and print (same logic as before)
+        # Aggregate by process name and print
         $agg = @{}
         foreach ($e in $entriesList) {
             $pidNum = [int]$e.Key
@@ -621,5 +802,7 @@ try {
 }
 catch {
     Write-Error "Error: $_"
+    # ensure writers closed before exit
+    try { if ($monitor) { $monitor.CloseWriters() } } catch {}
     exit 1
 }
