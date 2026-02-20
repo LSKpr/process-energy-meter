@@ -1,3 +1,17 @@
+# ===========================
+# PowerInterface.ps1
+# Interactive UI (CONSUMER)
+# ===========================
+
+# NOTE:
+# Core script-scoped state (SampleIntervalMs, writers, caches, stopwatch, etc.)
+# is owned and initialized by PowerSampleLogic.ps1.
+# Do NOT reinitialize $script: variables here.
+
+# ---------------------------
+#region UI configuration
+# ---------------------------
+
 param(
     [int]$MeasurementIntervalSeconds = 2,
     [int]$SampleInterval = 100,
@@ -18,6 +32,98 @@ $script:Colors = @{
     Highlight = 'Magenta'
     Graph = 'Blue'
 }
+
+$script:CurrentView = "list"
+$script:CurrentViewParam = 20
+$script:CurrentTopList = @()
+$script:MonitoringStartTime = Get-Date
+$script:MeasurementInterval = 2
+
+$script:GpuName = $null
+$script:GpuIdlePowerMin = $null
+$script:GpuIdlePowerMax = $null
+$script:GpuIdleFanPercent = $null
+$script:GpuIdleTemperatureC = $null
+
+#endregion
+
+# ---------------------------
+#region UI helpers
+# ---------------------------
+
+function Show-CommandHelp {
+    Clear-Host
+    Write-Host "`n========================================================" -ForegroundColor $script:Colors.Header
+    Write-Host "   Command Help                                         " -ForegroundColor $script:Colors.Header
+    Write-Host "========================================================" -ForegroundColor $script:Colors.Header
+    Write-Host ""
+    Write-Host "Available Commands:" -ForegroundColor $script:Colors.Highlight
+    Write-Host ""
+    Write-Host "  list X      - Show top X processes by energy consumption" -ForegroundColor $script:Colors.Info
+    Write-Host "                Example: list 5, list 10, list 20" -ForegroundColor Gray
+    Write-Host ""
+    Write-Host "  focus X     - Show detailed view of process #X from list" -ForegroundColor $script:Colors.Info
+    Write-Host "                Example: focus 1 (focuses on #1 process)" -ForegroundColor Gray
+    Write-Host ""
+    Write-Host "  interval X  - Change measurement interval (1-60 seconds)" -ForegroundColor $script:Colors.Info
+    Write-Host "                Example: interval 1, interval 5" -ForegroundColor Gray
+    Write-Host ""
+    Write-Host "  help        - Show this help message" -ForegroundColor $script:Colors.Info
+    Write-Host ""
+    Write-Host "  quit/exit   - Exit the program" -ForegroundColor $script:Colors.Info
+    Write-Host ""
+    Write-Host "Note: All views auto-update. Monitoring runs continuously" -ForegroundColor Yellow
+    Write-Host "      in background. Energy is accumulated from program start." -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "Press any key to return..." -ForegroundColor $script:Colors.Info
+    $null = [Console]::ReadKey($true)
+}
+
+function Draw-PowerGraph {
+    param(
+        [array]$PowerHistory,
+        [int]$Width = 60,
+        [int]$Height = 10
+    )
+    
+    if ($PowerHistory.Count -eq 0) {
+        Write-Host "  No data yet..." -ForegroundColor $script:Colors.Info
+        return
+    }
+    
+    $maxPower = ($PowerHistory | Measure-Object -Maximum).Maximum
+    if ($maxPower -eq 0) { $maxPower = 1 }
+    
+    Write-Host "`n  Power History (Last $($PowerHistory.Count) measurements):" -ForegroundColor $script:Colors.Info
+    Write-Host ("  Max: {0:N3} W" -f ($maxPower / 1000)) -ForegroundColor $script:Colors.Value
+    
+    # Draw graph from top to bottom
+    for ($row = $Height; $row -gt 0; $row--) {
+        $threshold = ($maxPower / $Height) * $row
+        $line = "  "
+        
+        foreach ($power in $PowerHistory | Select-Object -Last $Width) {
+            if ($power -ge $threshold) {
+                $line += "#"
+            }
+            else {
+                $line += " "
+            }
+        }
+        
+        Write-Host $line -ForegroundColor $script:Colors.Graph
+    }
+    
+    # Draw baseline
+    Write-Host ("  " + ("-" * ([Math]::Min($PowerHistory.Count, $Width)))) -ForegroundColor $script:Colors.Graph
+    Write-Host ("  Min: {0:N3} W" -f (($PowerHistory | Measure-Object -Minimum).Minimum / 1000)) -ForegroundColor $script:Colors.Value
+}
+
+#endregion
+
+# ---------------------------
+#region Read helpers for CSV
+# ---------------------------
 
 function Read-LatestCpuProcessAggregates {
     param(
@@ -77,7 +183,6 @@ function Read-LatestCpuProcessAggregates {
     return $result
 }
 
-
 function Read-LatestCpuSample {
     param(
         [string]$CpuSamplesCsvPath,
@@ -126,47 +231,154 @@ function Read-LatestCpuSample {
     return $null
 }
 
-function Draw-PowerGraph {
+# --------------------------
+# GPU CSV readers (real-time)
+# --------------------------
+
+function Read-LatestGpuProcessAggregates {
     param(
-        [array]$PowerHistory,
-        [int]$Width = 60,
-        [int]$Height = 10
+        [string]$GpuProcessesCsvPath = $script:ProcessesCsvPath,
+        [int]$TailLines = 4096
     )
-    
-    if ($PowerHistory.Count -eq 0) {
-        Write-Host "  No data yet..." -ForegroundColor $script:Colors.Info
-        return
-    }
-    
-    $maxPower = ($PowerHistory | Measure-Object -Maximum).Maximum
-    if ($maxPower -eq 0) { $maxPower = 1 }
-    
-    Write-Host "`n  Power History (Last $($PowerHistory.Count) measurements):" -ForegroundColor $script:Colors.Info
-    Write-Host ("  Max: {0:N3} W" -f ($maxPower / 1000)) -ForegroundColor $script:Colors.Value
-    
-    # Draw graph from top to bottom
-    for ($row = $Height; $row -gt 0; $row--) {
-        $threshold = ($maxPower / $Height) * $row
-        $line = "  "
-        
-        foreach ($power in $PowerHistory | Select-Object -Last $Width) {
-            if ($power -ge $threshold) {
-                $line += "#"
-            }
-            else {
-                $line += " "
-            }
+
+    $result = @{}
+
+    if (-not $GpuProcessesCsvPath) { return $result }
+    if (-not (Test-Path $GpuProcessesCsvPath)) { return $result }
+
+    # Read last N lines efficiently
+    $lines = Get-Content -Path $GpuProcessesCsvPath -Tail $TailLines -ErrorAction SilentlyContinue
+    if (-not $lines) { return $result }
+
+    # Pattern for: Timestamp,PID,ProcessName,SMUtil,MemUtil,EncUtil,DecUtil,PowerW,EnergyJ,AccumulatedProcessEnergyJ,WeightedUtil,IsIdle
+    $pattern = '^\s*(?:"(?<ts>[^"]*)"|(?<ts>[^,]*))\s*,\s*(?<pid>[^,]+)\s*,\s*(?:"(?<name>(?:[^"]|"")*)"|(?<name>[^,]*))\s*,\s*(?<sm>[^,]+)\s*,\s*(?<mem>[^,]+)\s*,\s*(?<enc>[^,]+)\s*,\s*(?<dec>[^,]+)\s*,\s*(?<pw>[^,]+)\s*,\s*(?<ej>[^,]+)\s*,\s*(?<acc>[^,]+)\s*,\s*(?<w>[^,]+)\s*,\s*(?<idle>[^,]+)\s*$'
+    $regex = [System.Text.RegularExpressions.Regex]::new($pattern, [System.Text.RegularExpressions.RegexOptions]::Compiled)
+    $ci = [System.Globalization.CultureInfo]::InvariantCulture
+
+    foreach ($line in $lines) {
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        if ($line.TrimStart().StartsWith('Timestamp', [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+
+        $m = $regex.Match($line)
+        if (-not $m.Success) { continue }
+
+        $pidRaw = $m.Groups['pid'].Value.Trim()
+        # parse pid as int where possible
+        $pidInt = 0
+        try { [int]::TryParse($pidRaw, [ref]$pidInt) | Out-Null } catch { $pidInt = 0 }
+
+        $procNameRaw = $m.Groups['name'].Value
+        $procName = $procNameRaw -replace '""', '"'   # unescape CSV double-quotes
+
+        # parse numeric fields defensively
+        $sm = 0.0; $mem = 0.0; $enc = 0.0; $dec = 0.0
+        $powerW = 0.0; $energyJ = 0.0; $accumJ = 0.0; $weighted = 0.0
+        $isIdle = $false
+        try { $sm = [double]::Parse($m.Groups['sm'].Value, [System.Globalization.NumberStyles]::Float, $ci) } catch {}
+        try { $mem = [double]::Parse($m.Groups['mem'].Value, [System.Globalization.NumberStyles]::Float, $ci) } catch {}
+        try { $enc = [double]::Parse($m.Groups['enc'].Value, [System.Globalization.NumberStyles]::Float, $ci) } catch {}
+        try { $dec = [double]::Parse($m.Groups['dec'].Value, [System.Globalization.NumberStyles]::Float, $ci) } catch {}
+        try { $powerW = [double]::Parse($m.Groups['pw'].Value, [System.Globalization.NumberStyles]::Float, $ci) } catch {}
+        try { $energyJ = [double]::Parse($m.Groups['ej'].Value, [System.Globalization.NumberStyles]::Float, $ci) } catch {}
+        try { $accumJ = [double]::Parse($m.Groups['acc'].Value, [System.Globalization.NumberStyles]::Float, $ci) } catch {}
+        try { $weighted = [double]::Parse($m.Groups['w'].Value, [System.Globalization.NumberStyles]::Float, $ci) } catch {}
+        try { $isIdle = [bool]::Parse($m.Groups['idle'].Value) } catch {}
+
+        # last occurrence wins because we're reading tail-to-head chronological order
+        $key = if ($pidInt -ne 0) { $pidInt } else { $pidRaw }
+
+        $result[$key] = @{
+            PID = $key
+            ProcessName = $procName
+            SMUtil = $sm
+            MemUtil = $mem
+            EncUtil = $enc
+            DecUtil = $dec
+            PowerW = $powerW
+            EnergyJ = $energyJ
+            AccumulatedProcessEnergyJ = $accumJ
+            WeightedUtil = $weighted
+            IsIdle = $isIdle
         }
-        
-        Write-Host $line -ForegroundColor $script:Colors.Graph
     }
-    
-    # Draw baseline
-    Write-Host ("  " + ("-" * ([Math]::Min($PowerHistory.Count, $Width)))) -ForegroundColor $script:Colors.Graph
-    Write-Host ("  Min: {0:N3} W" -f (($PowerHistory | Measure-Object -Minimum).Minimum / 1000)) -ForegroundColor $script:Colors.Value
+
+    return $result
 }
 
-#region Command Line Interface
+function Read-LatestGpuSample {
+    param(
+        [string]$GpuSamplesCsvPath = $script:SamplesCsvPath,
+        [int]$TailLines = 20
+    )
+
+    if (-not $GpuSamplesCsvPath) { return $null }
+    if (-not (Test-Path $GpuSamplesCsvPath)) { return $null }
+
+    $lines = Get-Content -Path $GpuSamplesCsvPath -Tail $TailLines -ErrorAction SilentlyContinue
+    if (-not $lines) { return $null }
+
+    # Pattern:
+    # Timestamp,PowerW,ActivePowerW,ExcessPowerW,GpuSMUtil,GpuMemUtil,GpuEncUtil,GpuDecUtil,GpuWeightTotal,ProcessWeightTotal,ProcessCount,AttributedPowerW,ResidualPowerW,AccumulatedEnergyJ,TemperatureC,FanPercent
+    $pattern = '^\s*(?:"(?<ts>[^"]*)"|(?<ts>[^,]*))\s*,\s*(?<pw>[^,]+)\s*,\s*(?<active>[^,]+)\s*,\s*(?<excess>[^,]+)\s*,\s*(?<sm>[^,]+)\s*,\s*(?<mem>[^,]+)\s*,\s*(?<enc>[^,]+)\s*,\s*(?<dec>[^,]+)\s*,\s*(?<wtotal>[^,]+)\s*,\s*(?<pwtotal>[^,]+)\s*,\s*(?<pcnt>[^,]+)\s*,\s*(?<attr>[^,]+)\s*,\s*(?<res>[^,]+)\s*,\s*(?<acc>[^,]+)\s*,\s*(?<temp>[^,]+)\s*,\s*(?<fan>[^,]+)\s*$'
+    $regex = [System.Text.RegularExpressions.Regex]::new($pattern, [System.Text.RegularExpressions.RegexOptions]::Compiled)
+    $ci = [System.Globalization.CultureInfo]::InvariantCulture
+
+    # pick last non-header matching line
+    for ($i = $lines.Length - 1; $i -ge 0; $i--) {
+        $line = $lines[$i]
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        if ($line.TrimStart().StartsWith('Timestamp', [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+
+        $m = $regex.Match($line)
+        if (-not $m.Success) { continue }
+
+        $ts = $m.Groups['ts'].Value
+        $pw = 0.0; $active = 0.0; $excess = 0.0; $sm=0.0; $mem=0.0; $enc=0.0; $dec=0.0
+        $wtotal = 0.0; $pwtotal = 0.0; $pcnt = 0; $attr = 0.0; $res = 0.0; $acc = 0.0; $temp=0.0; $fan=0.0
+        try { $pw = [double]::Parse($m.Groups['pw'].Value, $ci) } catch {}
+        try { $active = [double]::Parse($m.Groups['active'].Value, $ci) } catch {}
+        try { $excess = [double]::Parse($m.Groups['excess'].Value, $ci) } catch {}
+        try { $sm = [double]::Parse($m.Groups['sm'].Value, $ci) } catch {}
+        try { $mem = [double]::Parse($m.Groups['mem'].Value, $ci) } catch {}
+        try { $enc = [double]::Parse($m.Groups['enc'].Value, $ci) } catch {}
+        try { $dec = [double]::Parse($m.Groups['dec'].Value, $ci) } catch {}
+        try { $wtotal = [double]::Parse($m.Groups['wtotal'].Value, $ci) } catch {}
+        try { $pwtotal = [double]::Parse($m.Groups['pwtotal'].Value, $ci) } catch {}
+        try { $pcnt = [int]::Parse($m.Groups['pcnt'].Value) } catch {}
+        try { $attr = [double]::Parse($m.Groups['attr'].Value, $ci) } catch {}
+        try { $res = [double]::Parse($m.Groups['res'].Value, $ci) } catch {}
+        try { $acc = [double]::Parse($m.Groups['acc'].Value, $ci) } catch {}
+        try { $temp = [double]::Parse($m.Groups['temp'].Value, $ci) } catch {}
+        try { $fan = [double]::Parse($m.Groups['fan'].Value, $ci) } catch {}
+
+        return @{
+            Timestamp = $ts
+            PowerW = $pw
+            ActivePowerW = $active
+            ExcessPowerW = $excess
+            GpuSmUtil = $sm
+            GpuMemUtil = $mem
+            GpuEncUtil = $enc
+            GpuDecUtil = $dec
+            GpuWeightTotal = $wtotal
+            ProcessWeightTotal = $pwtotal
+            ProcessCount = $pcnt
+            AttributedPowerW = $attr
+            ResidualPowerW = $res
+            AccumulatedEnergyJ = $acc
+            TemperatureC = $temp
+            FanPercent = $fan
+        }
+    }
+
+    return $null
+}
+
+#endregion
+
+# ---------------------------
+#region Main interactive loop
+# ---------------------------
 
 function Show-TopList {
     param(
@@ -294,100 +506,114 @@ function Show-TopList {
         $rank++
     }
 
-    #GPU section (unchanged)
-    # Build list of entries (Key,Value) to avoid repeated enumerations
-    $entriesList = New-Object 'System.Collections.Generic.List[object]'
-    $iter = $script:ProcessEnergyJoules.GetEnumerator()
-    while ($iter.MoveNext()) {
-        $entriesList.Add(@{ Key = $iter.Current.Key; Value = [double]$iter.Current.Value })
+    # ---------------- GPU REAL-TIME SUMMARY (Report()-equivalent) ----------------
+    # Determine GPU CSV paths (fallback to script globals)
+    $gpuSamplesPath = if ($script:SamplesCsvPath) { $script:SamplesCsvPath } else { $null }
+    $gpuProcsPath   = if ($script:ProcessesCsvPath) { $script:ProcessesCsvPath } else { $null }
+
+    # Try to read GPU sample & per-process aggregates from CSV; fall back to in-memory if missing
+    $gpuEntries = @{}   # pid -> aggregated info
+    $latestGpuSample = $null
+
+    if ($gpuProcsPath -and (Test-Path $gpuProcsPath)) {
+        try {
+            $gpuEntries = Read-LatestGpuProcessAggregates -GpuProcessesCsvPath $gpuProcsPath -TailLines 4096
+        } catch { $gpuEntries = @{} }
     }
 
-    # Map PIDs -> process names with a single Get-Process call (best-effort)
+    if ($gpuSamplesPath -and (Test-Path $gpuSamplesPath)) {
+        try {
+            $latestGpuSample = Read-LatestGpuSample -GpuSamplesCsvPath $gpuSamplesPath -TailLines 20
+        } catch { $latestGpuSample = $null }
+    }
+
+    # Build entriesList for display (prefer CSV aggregates; otherwise fallback to in-memory ProcessEnergyJoules)
+    $entriesList = New-Object 'System.Collections.Generic.List[object]'
+
+    if ($gpuEntries.Count -gt 0) {
+        foreach ($kv in $gpuEntries.GetEnumerator()) {
+            $pidKey = $kv.Key
+            $acc = if ($kv.Value.AccumulatedProcessEnergyJ) { [double]$kv.Value.AccumulatedProcessEnergyJ } else { 0.0 }
+            $entriesList.Add(@{ Key = $pidKey; Value = $acc; Name = $kv.Value.ProcessName })
+        }
+    } else {
+        # fallback to in-memory map
+        $iter = $script:ProcessEnergyJoules.GetEnumerator()
+        while ($iter.MoveNext()) {
+            $entriesList.Add(@{ Key = $iter.Current.Key; Value = [double]$iter.Current.Value })
+        }
+    }
+
+    # Choose which total GPU energy to display: CSV sample preferred, then script value
+    $gpuTotalEnergyToDisplay = if ($latestGpuSample -and ($null -ne $latestGpuSample.AccumulatedEnergyJ)) { $latestGpuSample.AccumulatedEnergyJ } else { $script:GpuEnergyJoules }
+
+    # Map PIDs -> Names
     $allPids = $entriesList | ForEach-Object { [int]$_.Key } | Sort-Object -Unique
     $pidToName = @{}
-    if ($allPids.Count -gt 0) {
-        try {
-            $procs = Get-Process -Id $allPids -ErrorAction SilentlyContinue
-            foreach ($pr in $procs) { $pidToName[[int]$pr.Id] = $pr.ProcessName }
-        } catch {}
+    # First, use CSV-provided names (if present)
+    if ($gpuEntries.Count -gt 0) {
+        foreach ($kv in $gpuEntries.GetEnumerator()) {
+            $procId = $kv.Key
+            $pidToName[[int]$procId] = $kv.Value.ProcessName
+        }
     }
-
-    # Efficient fallback: build a single fast map from samples for missing PIDs
-    # (avoid repeated scanning of $script:Samples per PID)
+    # Then try Get-Process for any missing names
     $missingPids = @()
     foreach ($procId in $allPids) { if (-not $pidToName.ContainsKey($procId)) { $missingPids += $procId } }
     if ($missingPids.Count -gt 0) {
-        $samplePidNameMap = @{}
-        foreach ($s in $script:Samples) {
-            if ($s.PerProcess) {
-                foreach ($pidKey in $s.PerProcess.Keys) {
-                    $pidInt = [int]$pidKey
-                    if (-not $pidToName.ContainsKey($pidInt) -and -not $samplePidNameMap.ContainsKey($pidInt)) {
-                        $pp = $s.PerProcess[[string]$pidKey]
-                        if ($pp -and $pp.ProcessName) {
-                            $samplePidNameMap[$pidInt] = [string]$pp.ProcessName
-                        }
+        try {
+            $procs = Get-Process -Id $missingPids -ErrorAction SilentlyContinue
+            foreach ($pr in $procs) { $pidToName[[int]$pr.Id] = $pr.ProcessName }
+        } catch {}
+    }
+    # Final fallback to samples array for names (already done in old logic)
+    foreach ($procId in $allPids) {
+        if (-not $pidToName.ContainsKey($procId)) {
+            foreach ($s in $script:Samples) {
+                if ($s.PerProcess -and $s.PerProcess.ContainsKey([string]$procId)) {
+                    $pp = $s.PerProcess[[string]$procId]
+                    if ($pp -and $pp.ProcessName) {
+                        $pidToName[[int]$procId] = [string]$pp.ProcessName
+                        break
                     }
                 }
             }
-            # short-circuit if we've resolved all missing pids
-            if ($samplePidNameMap.Keys.Count -ge $missingPids.Count) { break }
         }
-        foreach ($mp in $samplePidNameMap.Keys) { if (-not $pidToName.ContainsKey($mp)) { $pidToName[$mp] = $samplePidNameMap[$mp] } }
     }
-
-    Write-Host "`n========================================================" -ForegroundColor $script:Colors.Header
-    Write-Host "   GPU Process Power Monitor                    " -ForegroundColor $script:Colors.Header
-    Write-Host "========================================================" -ForegroundColor $script:Colors.Header
-    Write-Host ""
-    Write-Host ("  Measurements:        {0}" -f $SampleCount) -ForegroundColor $script:Colors.Value
-    Write-Host ("  Measurement Interval: {0}ms" -f $script:SampleIntervalMs) -ForegroundColor $script:Colors.Value
-    Write-Host ("  Tracked Processes:   {0}" -f $allPids.Count) -ForegroundColor $script:Colors.Value
-    Write-Host ("  GPU Power attribution weights: SM={0:F2}, Mem={1:F2}, Enc={2:F2}, Dec={3:F2}" -f $script:WeightSM, $script:WeightMemory, $script:WeightEncoder, $script:WeightDecoder)
-    Write-Host ("  Idle GPU power measured: {0:N2}W [Min: {1:N2}W  Max:{2:N2}W] with {3} Processes; Temp: {4:F1}C  Fan: {5:F1}%" -f `
-        $script:GpuIdlePower, $script:GpuIdlePowerMin, $script:GpuIdlePowerMax, $script:IdleProcessCount, $script:GpuIdleTemperatureC, $script:GpuIdleFanPercent)
-    Write-Host ""
-    Write-Host ("  Total GPU Energy:    {0:F2} J" -f $script:GpuEnergyJoules) -ForegroundColor Yellow
 
     # Sum per-process energies
-    $sumTotalProcessesEnergy = 0.0
-    foreach ($e in $entriesList) { $sumTotalProcessesEnergy += [double]$e.Value }
+    $sumAttributedEnergy = 0.0
+    foreach ($e in $entriesList) { $sumAttributedEnergy += [double]$e.Value }
 
-    # Diagnostic compare total vs sum of processes
-    if ($sumTotalProcessesEnergy -gt 0) {
-        $diff = [math]::Abs([double]$script:GpuEnergyJoules - $sumTotalProcessesEnergy)
-        $diffPct = if ($script:GpuEnergyJoules -gt 0) { 100.0 * $diff / $script:GpuEnergyJoules } else { 0.0 }
-        Write-Host ("  Measured total {0:F2} J vs summed attributed {1:F2} J -> Diff: {2:F2} J ({3:F1}%)" -f $script:GpuEnergyJoules, $sumTotalProcessesEnergy, $diff, $diffPct)
-    }
-    else {
+    # Display GPU summary (uses gpuTotalEnergyToDisplay and entriesList)
+    Write-Host "`n========================================================" -ForegroundColor $script:Colors.Header
+    Write-Host "   GPU Process Power Monitor (Realtime)                  " -ForegroundColor $script:Colors.Header
+    Write-Host "========================================================" -ForegroundColor $script:Colors.Header
+    Write-Host ""
+    Write-Host ("  Total GPU Energy (measured):   {0:F2} J" -f $gpuTotalEnergyToDisplay) -ForegroundColor Yellow
+    Write-Host ("  Sum Attributed GPU Energy:     {0:F2} J" -f $sumAttributedEnergy) -ForegroundColor Yellow
+
+    if ($sumAttributedEnergy -gt 0) {
+        $diff = [math]::Abs($gpuTotalEnergyToDisplay - $sumAttributedEnergy)
+        $pct  = if ($gpuTotalEnergyToDisplay -gt 0) { 100 * $diff / $gpuTotalEnergyToDisplay } else { 0 }
+        Write-Host ("  Attribution Diff:              {0:F2} J ({1:F1}%)" -f $diff, $pct)
+    } else {
         Write-Host ""
     }
+
     Write-Host ""
-    Write-Host "Top GPU Processes:" -ForegroundColor $script:Colors.Highlight
-    Write-Host ("{0,-15} {1,-30} {2,12} {3,10}" -f "PID", "Process", "GPU Energy", "GPU %") -ForegroundColor $script:Colors.Header
-    Write-Host ("-" * 75) -ForegroundColor $script:Colors.Header
+    Write-Host ("{0,-10} {1,-30} {2,12} {3,8}" -f "PID","Process","Energy (J)","GPU %") -ForegroundColor $script:Colors.Header
+    Write-Host ("-" * 70)
 
-    # Build per-PID list and sort descending by energy (do not aggregate by name)
-    $perPidList = @()
-    foreach ($e in $entriesList) {
-        $pidNum = [int]$e.Key
-        $pname = if ($pidToName.ContainsKey($pidNum)) { $pidToName[$pidNum] } else { "[exited] PID $pidNum" }
-        $perPidList += [PSCustomObject]@{
-            PID = $pidNum
-            ProcessName = $pname
-            Energy = [double]$e.Value
+    $entriesList |
+        Sort-Object { [double]$_.'Value' } -Descending |
+        ForEach-Object {
+            $procId = [int]$_.Key
+            $energy = [double]$_.Value
+            $name = if ($pidToName.ContainsKey($procId)) { $pidToName[$procId] } else { (if ($_.Name) { $_.Name } else { "[exited]" }) }
+            $pct = if ($sumAttributedEnergy -gt 0) { 100 * $energy / $sumAttributedEnergy } else { 0 }
+            Write-Host ("{0,-10} {1,-30} {2,12:F2} {3,7:F1}%" -f $procId, $name, $energy, $pct)
         }
-    }
-
-    $sortedPerPid = $perPidList | Sort-Object -Property @{ Expression = { $_.Energy } } -Descending
-
-    foreach ($entry in $sortedPerPid) {
-        $pidText = $entry.PID
-        $name = $entry.ProcessName
-        $energy = $entry.Energy
-        $pct = if ($sumTotalProcessesEnergy -gt 0) { 100.0 * $energy / $sumTotalProcessesEnergy } else { 0.0 }
-        Write-Host ("{0,-15} {1,-30} {2,12:F2}J {3,5:F1}%" -f $pidText, $name, $energy, $pct)
-    }
     
     Write-Host ""
     Write-Host "Commands: list X | focus X | interval X | help | quit" -ForegroundColor $script:Colors.Info
@@ -457,37 +683,13 @@ function Show-FocusedView {
     Write-Host "Command> " -NoNewline -ForegroundColor $script:Colors.Highlight
 }
 
-function Show-CommandHelp {
-    Clear-Host
-    Write-Host "`n========================================================" -ForegroundColor $script:Colors.Header
-    Write-Host "   Command Help                                         " -ForegroundColor $script:Colors.Header
-    Write-Host "========================================================" -ForegroundColor $script:Colors.Header
-    Write-Host ""
-    Write-Host "Available Commands:" -ForegroundColor $script:Colors.Highlight
-    Write-Host ""
-    Write-Host "  list X      - Show top X processes by energy consumption" -ForegroundColor $script:Colors.Info
-    Write-Host "                Example: list 5, list 10, list 20" -ForegroundColor Gray
-    Write-Host ""
-    Write-Host "  focus X     - Show detailed view of process #X from list" -ForegroundColor $script:Colors.Info
-    Write-Host "                Example: focus 1 (focuses on #1 process)" -ForegroundColor Gray
-    Write-Host ""
-    Write-Host "  interval X  - Change measurement interval (1-60 seconds)" -ForegroundColor $script:Colors.Info
-    Write-Host "                Example: interval 1, interval 5" -ForegroundColor Gray
-    Write-Host ""
-    Write-Host "  help        - Show this help message" -ForegroundColor $script:Colors.Info
-    Write-Host ""
-    Write-Host "  quit/exit   - Exit the program" -ForegroundColor $script:Colors.Info
-    Write-Host ""
-    Write-Host "Note: All views auto-update. Monitoring runs continuously" -ForegroundColor Yellow
-    Write-Host "      in background. Energy is accumulated from program start." -ForegroundColor Yellow
-    Write-Host ""
-    Write-Host "Press any key to return..." -ForegroundColor $script:Colors.Info
-    $null = [Console]::ReadKey($true)
-}
-
 function Start-CommandLineMode {
     param([int]$IntervalSeconds)
-    
+
+    # Get GPU name
+    $gpuNameOutput = nvidia-smi --query-gpu=name --format=csv,noheader 2>$null
+    $script:GpuName = if ($gpuNameOutput) { $gpuNameOutput.Trim() } else { "unknown" }
+
     Clear-Host
     Write-Host "`n========================================================" -ForegroundColor $script:Colors.Header
     Write-Host "   Interactive Process Power Monitor                    " -ForegroundColor $script:Colors.Header
@@ -496,19 +698,11 @@ function Start-CommandLineMode {
     Write-Host "CPU: $($script:CpuHardware.Name)" -ForegroundColor $script:Colors.Value
     Write-Host "GPU: $($script:GpuName)" -ForegroundColor $script:Colors.Value
     Write-Host "========================================================" -ForegroundColor $script:Colors.Header
-    
-    $testSystemPower = Get-SystemPowerConsumption
-    if ($null -eq $testSystemPower) {
-        Write-Host "System Power: Not Available" -ForegroundColor Yellow
-    }
-    else {
-        Write-Host "System Power: Available" -ForegroundColor Green
-    }
-    
+
     Write-Host ""
     Write-Host "Collecting initial CPU data..." -ForegroundColor $script:Colors.Info
 
-    # Ensure high-resolution stopwatch is available and warm before CPU warm-up
+    # Stopwatch
     if (-not $script:Stopwatch) {
         $script:Stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     } else {
@@ -519,142 +713,103 @@ function Start-CommandLineMode {
         $script:StopwatchFrequency = [int64][System.Diagnostics.Stopwatch]::Frequency
     }
 
-    # reset CPU sampling baseline so Update-CPUEnergyData will initialize on first call
-    $script:LastCpuSampleTicks = 0
-
-    # Collect initial CPU data (warm-up); Update-CPUEnergyData uses stopwatch dt internally
+    # CPU warm-up
+    $script:LastCpuSampleTicks = $script:Stopwatch.ElapsedTicks
     for ($i = 0; $i -lt 3; $i++) {
-        $null = Update-CPUEnergyData
+        Update-CPUEnergyData
         Start-Sleep -Seconds $IntervalSeconds
-        Write-Host "." -NoNewline -ForegroundColor $script:Colors.Info
+        Write-Host "." -NoNewline
     }
 
-    # Measure idle GPU metrics
-    Write-Host "`nMeasuring idle GPU power (please ensure GPU is idle; close heavy apps)."
+    # Measure idle GPU
+    Write-Host "`nMeasuring idle GPU power..."
     Measure-IdleMetrics
-    
-    Write-Host "`n`nStarting with list 20 view...`n" -ForegroundColor Green
+
+    Write-Host "`nStarting interactive view...`n" -ForegroundColor Green
     Start-Sleep -Seconds 1
-    
-    # Set initial view
+
     $script:CurrentView = "list"
     $script:CurrentViewParam = 20
-    $script:MonitoringStartTime = Get-Date
-    
-    # Hide cursor for cleaner display
     [Console]::CursorVisible = $false
-    
-    # Set initial interval
-    $script:MeasurementInterval = $IntervalSeconds
 
-    # compute GPU sample interval in ticks (SampleIntervalMs is milliseconds)
+    # === GPU SAMPLING ===
+
     $intervalTicksGPU = [int64]([double]$script:SampleIntervalMs * $script:StopwatchFrequency / 1000.0)
     if ($intervalTicksGPU -le 0) { $intervalTicksGPU = 1 }
+    $script:LastSampleTime = $script:Stopwatch.ElapsedTicks
+    $scheduledTickGPU = $script:LastSampleTime + $intervalTicksGPU
 
-    # compute CPU measurement interval in ticks (MeasurementInterval is seconds)
+    # CPU sampling
+    $script:MeasurementInterval = $IntervalSeconds
     $intervalTicksCPU = [int64]([double]$script:MeasurementInterval * $script:StopwatchFrequency)
     if ($intervalTicksCPU -le 0) { $intervalTicksCPU = 1 }
+    $scheduledTickCPU = $script:Stopwatch.ElapsedTicks + $intervalTicksCPU
 
-    # Track last update times (ticks)
-    $script:LastSampleTime = $script:Stopwatch.ElapsedTicks
+    # Display refresh (2s)
+    $displayIntervalTicks = [int64]([double]2000 * $script:StopwatchFrequency / 1000.0)
+    $scheduledTickDisplay = $script:Stopwatch.ElapsedTicks + $displayIntervalTicks
 
-    $scheduledTickGPU = $script:LastSampleTime + $intervalTicksGPU
-    $scheduledTickCPU = $script:LastSampleTime + $intervalTicksCPU
-
-    # 2 seconds for display refresh -> 2000 ms converted to ticks
-    $scheduledTickDisplay = $script:LastSampleTime + [int64]([double]2000 * $script:StopwatchFrequency / 1000.0)
-    
     $sampleCount = 0
+
     try {
-        # Show initial display
         Show-TopList -Count $script:CurrentViewParam -ClearScreen $true
         [Console]::CursorVisible = $true
-        
-        # Main input loop
+
         while ($true) {
             $now = $script:Stopwatch.ElapsedTicks
 
+            # === GPU sampling (bit-for-bit old behavior) ===
             $remainingGPU = $scheduledTickGPU - $now
-            $remainingCPU = $scheduledTickCPU - $now
-            $remainingDisplay = $scheduledTickDisplay - $now
-
-            # GPU sampling
             if ($remainingGPU -le 0) {
                 Update-GPUEnergyData
                 $sampleCount++
 
-                # advance scheduledTickGPU forward to the next future schedule
                 do {
                     $scheduledTickGPU += $intervalTicksGPU
                     $now = $script:Stopwatch.ElapsedTicks
                 } while ($scheduledTickGPU -le $now)
             }
 
-            # CPU sampling (stopwatch-driven sampler Update-CPUEnergyData)
-            if ($remainingCPU -le 0) {
+            # CPU sampling
+            if (($scheduledTickCPU - $now) -le 0) {
                 Update-CPUEnergyData
-
-                # advance scheduledTickCPU forward to the next future schedule
                 do {
                     $scheduledTickCPU += $intervalTicksCPU
                     $now = $script:Stopwatch.ElapsedTicks
                 } while ($scheduledTickCPU -le $now)
             }
 
-            # Display refresh every ~2s
-            if ($remainingDisplay -le 0) {
-                # Save cursor position
-                $cursorLeft = [Console]::CursorLeft
-                $cursorTop = [Console]::CursorTop
-                
-                # Update display without clearing input line
+            # Display refresh
+            if (($scheduledTickDisplay - $now) -le 0) {
                 [Console]::CursorVisible = $false
                 switch ($script:CurrentView) {
-                    "list" { Show-TopList -Count $script:CurrentViewParam -ClearScreen $false -SampleCount $sampleCount }
+                    "list"  { Show-TopList -Count $script:CurrentViewParam -ClearScreen $false -SampleCount $sampleCount }
                     "focus" { Show-FocusedView -ProcessName $script:CurrentViewParam }
                 }
-                
-                # Restore cursor position for input
-                [Console]::SetCursorPosition($cursorLeft, [Console]::WindowHeight - 2)
                 [Console]::CursorVisible = $true
-                
-                # advance scheduledTickDisplay forward to the next future schedule
+
                 do {
-                    $scheduledTickDisplay += [int64]([double]2000 * $script:StopwatchFrequency / 1000.0)
+                    $scheduledTickDisplay += $displayIntervalTicks
                     $now = $script:Stopwatch.ElapsedTicks
                 } while ($scheduledTickDisplay -le $now)
             }
 
-            # Compute minimal remaining time (ms) to sleep to avoid busy-looping
-            $remainingMsList = @()
-            foreach ($rem in @(($scheduledTickGPU - $now), ($scheduledTickCPU - $now), ($scheduledTickDisplay - $now))) {
-                if ($rem -gt 0) {
-                    $remainingMsList += [int]([double]$rem * 1000.0 / $script:StopwatchFrequency)
-                }
-            }
-            if ($remainingMsList.Count -gt 0) {
-                $minRemainingMs = ($remainingMsList | Measure-Object -Minimum).Minimum
-            } else {
-                $minRemainingMs = 10
-            }
-
-            # Non-blocking input check: if key available, avoid sleeping long
-            if (-not [Console]::KeyAvailable) {
-                if ($minRemainingMs -gt 5) {
-                    # Sleep slightly less than remaining time to wake up and be precise
-                    Start-Sleep -Milliseconds ($minRemainingMs - 3)
+            # Sleep logic
+            $nextTick = @($scheduledTickGPU, $scheduledTickCPU, $scheduledTickDisplay | Where-Object { $_ -gt $now } | Measure-Object -Minimum).Minimum
+            if ($nextTick) {
+                $remainingMs = [int]([double]($nextTick - $now) * 1000.0 / $script:StopwatchFrequency)
+                if ($remainingMs -gt 5) {
+                    Start-Sleep -Milliseconds ($remainingMs - 3)
                 } else {
-                    # very short remaining time — yield to OS
                     [System.Threading.Thread]::Sleep(0)
                 }
             }
 
             # Check for user input (non-blocking)
             if ([Console]::KeyAvailable) {
-                [Console]::CursorVisible = $true
-
-                # Read the entire line using native ReadLine (this will block briefly while user types)
                 $inputLine = [Console]::ReadLine()
+                if ($inputLine -match '^(quit|exit)$') { throw "EXIT" }
+
 
                 if (-not [string]::IsNullOrWhiteSpace($inputLine)) {
                     $parts = $inputLine.Trim() -split '\s+'
@@ -723,12 +878,6 @@ function Start-CommandLineMode {
                             Show-CommandHelp
                             [Console]::CursorVisible = $true
                         }
-                        'quit' {
-                            throw "EXIT"
-                        }
-                        'exit' {
-                            throw "EXIT"
-                        }
                         default {
                             Write-Host "`nIncorrect command. Type 'help' for available commands." -ForegroundColor $script:Colors.Warning
                             Start-Sleep -Seconds 2
@@ -750,79 +899,12 @@ function Start-CommandLineMode {
         }
     }
     finally {
-        # flush and close writers to ensure files are written
         try { Close-Writers } catch {}
-
-        # Cleanup
         [Console]::CursorVisible = $true
-
         if ($_.Exception.Message -eq "EXIT") {
             Write-Host "`nExiting..." -ForegroundColor $script:Colors.Info
         }
     }
-}
-
-#endregion
-
-#region Main Execution
-
-# Check admin privileges
-$isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-
-if (-not $isAdmin) {
-    Write-Host "`nERROR: This script requires Administrator privileges!" -ForegroundColor Red
-    Write-Host "Please run PowerShell as Administrator and try again.`n" -ForegroundColor Yellow
-    exit 1
-}
-
-Clear-Host
-Write-Host "`nInitializing Interactive Process Power Monitor..." -ForegroundColor Cyan
-Write-Host "=" * 60 -ForegroundColor Cyan
-
-# Initialize GPU/diagnostics/writers + internal script state
-Initialize-GPUProcessMonitor -SampleIntervalMs $SampleInterval -wSM $WeightSMP -wMem $WeightMem -wEnc $WeightEnc -wDec $WeightDec -diagPath $DiagnosticsOutput
-
-# Expose CPU CSV paths for the consumer UI (keep consistent with Open-Writers)
-$timestampForFile = $script:TimeStampLogging.ToString('yyyyMMdd_HHmmss')
-$outSpec = $script:DiagnosticsOutputPath
-if (-not $outSpec) {
-    $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
-    $outSpec = Join-Path $scriptDir 'power_diagnostics'
-}
-
-if ($outSpec -match '\.csv$') {
-    $script:CpuSamplesCsvPath = $outSpec -replace '\.csv$','_cpu_samples.csv'
-    $script:CpuProcessesCsvPath = $outSpec -replace '\.csv$','_cpu_processes.csv'
-} else {
-    $diagDir = $outSpec
-    $script:CpuSamplesCsvPath = Join-Path $diagDir ("cpu_samples_$timestampForFile.csv")
-    $script:CpuProcessesCsvPath = Join-Path $diagDir ("cpu_processes_$timestampForFile.csv")
-}
-
-# Initialize LibreHardwareMonitor (CPU power)
-$initialized = Initialize-LibreHardwareMonitor
-if (-not $initialized) {
-    Write-Host "`nFailed to initialize hardware monitoring (LibreHardwareMonitor). Exiting..." -ForegroundColor Red
-    # Close any writers we opened
-    try { Close-Writers } catch {}
-    exit 1
-}
-
-Write-Host "[OK] Hardware monitoring ready" -ForegroundColor Green
-
-# Start interactive mode (this will run until exit)
-try {
-    Start-CommandLineMode -IntervalSeconds $MeasurementIntervalSeconds
-}
-finally {
-    # Cleanup
-    try {
-        if ($null -ne $script:Computer) {
-            $script:Computer.Close()
-        }
-    } catch {}
-
-    Write-Host "`nThank you for using Process Power Monitor!`n" -ForegroundColor Cyan
 }
 
 #endregion
