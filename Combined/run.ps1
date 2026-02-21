@@ -19,6 +19,10 @@ $script:Colors = @{
     Graph = 'Blue'
 }
 
+# Dot-source logic
+. .\CpuMonitor.ps1
+. .\GpuMonitor.ps1
+
 #----------------------------------------------
 #region Utility
 #----------------------------------------------
