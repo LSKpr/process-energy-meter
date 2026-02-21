@@ -1,12 +1,3 @@
-<#
-Usage example:
-.\gpu_final.ps1
-Other flags of interest:
-    -SampleInterval: how often to sample in ms (default 100)
-    -WeightSM, WeightMem, WeightEnc, WeightDec: weights for the attribution formula (defaults: 1.0, 0.5, 0.25, 0.15)
-    -DiagnosticsOutput: base path for writing diagnostics CSV files (default "power_diagnostics")
-#>
-
 #----------------------------------------------
 #region Initialization
 #----------------------------------------------

@@ -1,3 +1,27 @@
+<#
+.SYNOPSIS
+    Interactive Process Power Monitor
+.DESCRIPTION
+    Command-line tool to monitor process power consumption with:
+    - Top X processes view
+    - Detailed single process monitoring with power graph
+    - Real-time power consumption tracking
+    
+    Requires: Administrator privileges and LibreHardwareMonitorLib.dll
+
+    Flags of interest:
+    -MeasurementIntervalSeconds: how often to sample CPU in seconds (default 2)
+    -SampleInterval: how often to sample GPU in ms (default 100)
+    -WeightSM, WeightMem, WeightEnc, WeightDec: weights for the attribution formula (defaults: 1.0, 0.5, 0.25, 0.15)
+    -DiagnosticsOutput: base path for writing diagnostics CSV files (default "power_diagnostics")
+
+.EXAMPLE
+    .\run.ps1
+    Starts the interactive monitor with default settings.
+
+    .\run.ps1 -MeasurementIntervalSeconds 1 -SampleInterval 50 -WeightSM 1.0 -WeightMem 0.5 -WeightEnc 0.25 -WeightDec 0.15
+#>
+
 param(
     [int]$MeasurementIntervalSeconds = 2,
     [int]$SampleInterval = 100,

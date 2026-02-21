@@ -1,15 +1,3 @@
-<#
-.SYNOPSIS
-    Interactive Process Power Monitor - mainlu CPU
-.DESCRIPTION
-    Command-line tool to monitor process power consumption with:
-    - Top X processes view
-    - Detailed single process monitoring with power graph
-    - Real-time power consumption tracking
-    
-    Requires: Administrator privileges and LibreHardwareMonitorLib.dll
-#>
-
 #----------------------------------------------
 #region Initialization
 #----------------------------------------------
@@ -193,3 +181,4 @@ function Update-ProcessEnergyData {
 
 #endregion
 # regions are cool :), hope u can see them
+# yeah I see them, didn't even know it was a thing (〃￣︶￣)人(￣︶￣〃)
