@@ -70,9 +70,16 @@ class GPUProcessMonitor {
         $this.MaxSamplesInMemory = 10000  # default; adjust if you want to keep more samples in memory
 
         # Get GPU name
-        $gpuNameOutput = nvidia-smi --query-gpu=name --format=csv,noheader 2>$null
-        $this.GpuName = if ($gpuNameOutput) { $gpuNameOutput.Trim() } else { "unknown" }
+        try {
+            $gpuNameOutput = nvidia-smi --query-gpu=name --format=csv,noheader 2>$null
+            $this.GpuName = if ($gpuNameOutput) { $gpuNameOutput.Trim() } else { "unknown" }
+        } catch {
+            $this.GpuName = "unknown"
+            $script:IsGpu = $false
+            return 
+        }
         Write-Host "Power attribution weights: SM=$wSM, Mem=$wMem, Enc=$wEnc, Dec=$wDec"
+        $script:IsGpu = $true
 
         # Setup diagnostics paths and open writers immediately (header creation happens here)
         try {
@@ -131,7 +138,13 @@ class GPUProcessMonitor {
         $idlePowerMin = 0
         $idlePowerMax = 0
         for ($i = 0; $i -lt 100; $i++) {
-            $out = nvidia-smi --query-gpu=power.draw.instant,temperature.gpu,fan.speed --format=csv,noheader,nounits 2>$null
+            try{
+                $out = nvidia-smi --query-gpu=power.draw.instant,temperature.gpu,fan.speed --format=csv,noheader,nounits 2>$null
+            }
+            catch {
+                # Write-Log(" $($_.Exception.Message)")
+                return
+            }
             if ($out -and -not [string]::IsNullOrWhiteSpace($out) -and $out.Trim() -ne '[N/A]') {
                 $parts = $out -split ',\s*'
                 if ($parts.Count -ge 3) {
@@ -218,7 +231,13 @@ class GPUProcessMonitor {
         }
 
         $resultList = [System.Collections.Generic.List[object]]::new()
-
+        try{
+            $pmonOutput = nvidia-smi pmon -c 1 2>$null
+        }
+        catch{
+            # Write-Host "`n`nNO nvidia-smi!!!!`n" ?
+            return $null
+        }
         $pmonOutput = nvidia-smi pmon -c 1 2>$null
         if (-not $pmonOutput) { return $resultList.ToArray() }
 
@@ -361,7 +380,12 @@ class GPUProcessMonitor {
         $gpuFanUtil = 0.0
 
         # Acquire GPU metrics and per-process entries
-        $combinedOut = nvidia-smi --query-gpu=timestamp,power.draw.instant,utilization.gpu,utilization.memory,utilization.encoder,utilization.decoder,temperature.gpu,fan.speed --format=csv,noheader,nounits 2>$null
+        try {
+                $combinedOut = nvidia-smi --query-gpu=timestamp,power.draw.instant,utilization.gpu,utilization.memory,utilization.encoder,utilization.decoder,temperature.gpu,fan.speed --format=csv,noheader,nounits 2>$null
+        }
+        catch {
+            return
+        }        
         $processEntries = $this.GetGpuProcesses()
         $parts = $combinedOut -split ',\s*'
         if ($parts.Count -ge 8) {

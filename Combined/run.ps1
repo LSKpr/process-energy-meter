@@ -1,4 +1,7 @@
 <#
+
+
+#TODO Kacper: do logs
 .SYNOPSIS
     Interactive Process Power Monitor
 .DESCRIPTION
@@ -118,12 +121,13 @@ $script:MonitoringStartTime = Get-Date
 $script:MeasurementInterval = 2
 
 $script:GpuMonitor = $null
+$script:IsGpu
 
 function Show-TopList {
     param(
         [int]$Count,
         [bool]$ClearScreen = $true,
-        [int]$SampleCount
+        [int]$SampleCount = 0
     )
     
     if ($Count -lt 1) { $Count = 1 }
@@ -198,8 +202,10 @@ function Show-TopList {
         $rank++
     }
 
-    Write-Host "`n==== GPU POWER SUMMARY ====" -ForegroundColor $script:Colors.Header
-    try { $script:GpuMonitor.Report($SampleCount) } catch {}
+    if ($script:IsGpu) {
+        Write-Host "`n==== GPU POWER SUMMARY ====" -ForegroundColor $script:Colors.Header
+        try { $script:GpuMonitor.Report($SampleCount) } catch {}
+    }
     
     Write-Host ""
     Write-Host "Commands: list X | focus X | interval X | help | quit" -ForegroundColor $script:Colors.Info
@@ -215,7 +221,7 @@ function Show-TopList {
         [Console]::SetCursorPosition(0, $windowHeight - 2)
     }
     
-    Write-Host "Command> " -NoNewline -ForegroundColor $script:Colors.Highlight
+    # Write-Host "Command> " -NoNewline -ForegroundColor $script:Colors.Highlight
 }
 
 function Show-FocusedView {
@@ -266,7 +272,7 @@ function Show-FocusedView {
     
     Write-Host ""
     Write-Host "Commands: list X | focus X | interval X | help | quit" -ForegroundColor $script:Colors.Info
-    Write-Host "Command> " -NoNewline -ForegroundColor $script:Colors.Highlight
+    # Write-Host "Command> " -NoNewline -ForegroundColor $script:Colors.Highlight
 }
 
 function Show-CommandHelp {
@@ -314,6 +320,9 @@ function Start-CommandLineMode {
     }
     else {
         Write-Host "System Power: Available" -ForegroundColor Green
+    }
+    if (-not $script:IsGpu) {
+        Write-Host "Warning: Nvidia-smi unavailable. Continues without GPU monitoring" -ForegroundColor $script:Colors.Warning
     }
     
     Write-Host ""
@@ -369,7 +378,7 @@ function Start-CommandLineMode {
     $sampleCount = 0
     try {
         # Show initial display
-        Show-TopList -Count $script:CurrentViewParam -ClearScreen $true
+        Show-TopList -Count $script:CurrentViewParam -ClearScreen $true -SampleCount $sampleCount
         [Console]::CursorVisible = $true
         
         # Main input loop
@@ -393,7 +402,7 @@ function Start-CommandLineMode {
                 # Update display without clearing input line
                 [Console]::CursorVisible = $false
                 switch ($script:CurrentView) {
-                    "list" { Show-TopList -Count $script:CurrentViewParam -ClearScreen $false }
+                    "list" { Show-TopList -Count $script:CurrentViewParam -ClearScreen $false -SampleCount $sampleCount }
                     "focus" { Show-FocusedView -ProcessName $script:CurrentViewParam }
                 }
                 
@@ -422,14 +431,14 @@ function Start-CommandLineMode {
                             }
                             $script:CurrentView = "list"
                             $script:CurrentViewParam = $count
-                            Show-TopList -Count $script:CurrentViewParam -ClearScreen $true -
+                            Show-TopList -Count $script:CurrentViewParam -ClearScreen $true -SampleCount $sampleCount
                             [Console]::CursorVisible = $true
                         }
                         'focus' {
                             if ($parts.Length -lt 2) {
                                 Write-Host "`nUsage: focus X (where X is process number)" -ForegroundColor $script:Colors.Warning
                                 Start-Sleep -Seconds 2
-                                Show-TopList -Count $script:CurrentViewParam -ClearScreen $true
+                                Show-TopList -Count $script:CurrentViewParam -ClearScreen $true -SampleCount $sampleCount
                                 [Console]::CursorVisible = $true
                             }
                             else {
@@ -444,7 +453,7 @@ function Start-CommandLineMode {
                                 else {
                                     Write-Host "`nInvalid process number" -ForegroundColor $script:Colors.Warning
                                     Start-Sleep -Seconds 2
-                                    Show-TopList -Count $script:CurrentViewParam -ClearScreen $true
+                                    Show-TopList -Count $script:CurrentViewParam -ClearScreen $true -SampleCount $sampleCount
                                     [Console]::CursorVisible = $true
                                 }
                             }
@@ -466,7 +475,7 @@ function Start-CommandLineMode {
                                     Start-Sleep -Seconds 2
                                 }
                             }
-                            Show-TopList -Count $script:CurrentViewParam -ClearScreen $true
+                            Show-TopList -Count $script:CurrentViewParam -ClearScreen $true -SampleCount $sampleCount
                             [Console]::CursorVisible = $true
                         }
                         'help' {
@@ -484,7 +493,7 @@ function Start-CommandLineMode {
                             Start-Sleep -Seconds 2
                             # Refresh current view properly
                             switch ($script:CurrentView) {
-                                "list" { Show-TopList -Count $script:CurrentViewParam -ClearScreen $true }
+                                "list" { Show-TopList -Count $script:CurrentViewParam -ClearScreen $true -SampleCount $sampleCount }
                                 "focus" { Show-FocusedView -ProcessName $script:CurrentViewParam }
                             }
                             [Console]::CursorVisible = $true
@@ -493,18 +502,25 @@ function Start-CommandLineMode {
                 }
                 else {
                     # Empty input - just refresh
-                    Show-TopList -Count $script:CurrentViewParam -ClearScreen $true
+                    Show-TopList -Count $script:CurrentViewParam -ClearScreen $true -SampleCount $sampleCount
                     [Console]::CursorVisible = $true
                 }
             }
             
+            if (-not $script:IsGpu) {
+                # If GPU monitoring not available, just sleep for the measurement interval
+                Start-Sleep -Seconds $script:MeasurementInterval
+                continue
+            }
             $now = $script:GpuMonitor.Stopwatch.ElapsedTicks
             $remaining = $scheduledTick - $now
             if ($remaining -le 0) {
                 # it's time (or past): do sample
-                $script:GpuMonitor.Sample()
-                $sampleCount++
-
+                try{
+                    $script:GpuMonitor.Sample()
+                    $sampleCount++
+                }
+                catch {}
                 # advance scheduledTick forward to the next future schedule
                 do {
                     $scheduledTick += $intervalTicks
