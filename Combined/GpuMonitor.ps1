@@ -20,6 +20,7 @@ class GPUProcessMonitor {
     [long]$LastSampleTime
     [datetime]$TimeStampLogging
     [hashtable]$ProcessEnergyJoules
+    [double]$GpuCurrentPower
     [string]$GpuName
     [double]$GpuEnergyJoules
     [double]$GpuIdlePower
@@ -51,6 +52,7 @@ class GPUProcessMonitor {
         $this.LastSampleTime = $this.Stopwatch.ElapsedTicks
         $this.TimeStampLogging = Get-Date
         $this.ProcessEnergyJoules = @{}
+        $this.GpuCurrentPower = 0.0
         $this.GpuEnergyJoules = 0.0
         $this.GpuIdleProcesses = @{}
         $this.DiagnosticsOutputPath = $diagPath
@@ -70,14 +72,7 @@ class GPUProcessMonitor {
         # Get GPU name
         $gpuNameOutput = nvidia-smi --query-gpu=name --format=csv,noheader 2>$null
         $this.GpuName = if ($gpuNameOutput) { $gpuNameOutput.Trim() } else { "unknown" }
-        Write-Log("Monitoring GPU: $($this.GpuName)")
         Write-Host "Power attribution weights: SM=$wSM, Mem=$wMem, Enc=$wEnc, Dec=$wDec"
-
-        # Measure idle metrics
-        Write-Log("Measuring idle power (please ensure GPU is idle; close heavy apps).")
-        $this.MeasureIdleMetrics()
-        Write-Log(("Idle GPU power measured: {0:N2}W [Min: {1:N2}W  Max:{2:N2}W] with {3} Processes; Temp: {4:F1}C  Fan: {5:F1}%" -f `
-            $this.GpuIdlePower, $this.GpuIdlePowerMin, $this.GpuIdlePowerMax, $this.IdleProcessCount, $this.GpuIdleTemperatureC, $this.GpuIdleFanPercent))
 
         # Setup diagnostics paths and open writers immediately (header creation happens here)
         try {
@@ -135,7 +130,7 @@ class GPUProcessMonitor {
         $idlePowerSamples = @()
         $idlePowerMin = 0
         $idlePowerMax = 0
-        for ($i = 0; $i -lt 50; $i++) {
+        for ($i = 0; $i -lt 100; $i++) {
             $out = nvidia-smi --query-gpu=power.draw.instant,temperature.gpu,fan.speed --format=csv,noheader,nounits 2>$null
             if ($out -and -not [string]::IsNullOrWhiteSpace($out) -and $out.Trim() -ne '[N/A]') {
                 $parts = $out -split ',\s*'
@@ -478,6 +473,7 @@ class GPUProcessMonitor {
         }
 
         # record sample in memory
+        $this.GpuCurrentPower = $gpuPower
         $this.GpuEnergyJoules += ($gpuPower * $dt)
         $accumulatedEnergy = $this.GpuEnergyJoules
         $sampleResidualPower = $gpuPower - $sampleAttributedPower
@@ -633,14 +629,25 @@ class GPUProcessMonitor {
     #region Interface
     #----------------------------------------------
 
-    [void] Report([double]$Duration) {
-        Write-Host "`n==== GPU POWER SUMMARY ===="
-
+    [void] Report([int]$SampleCount) {
+        $Duration = $this.Stopwatch.Elapsed.TotalSeconds
         $safeDuration = if ($Duration -le 0 -or [double]::IsNaN($Duration)) { 1.0 } else { [double]$Duration }
         $avgGpuPower = if ($safeDuration -gt 0) { $this.GpuEnergyJoules / $safeDuration } else { 0.0 }
-        Write-Host ("Total GPU - Accumulative: {0,8:F2} J  |  Average: {1,6:F2} W" -f $this.GpuEnergyJoules, $avgGpuPower)
 
-        Write-Host "`n==== PROCESS POWER ATTRIBUTION (Multi-Metric) ===="
+        $RuntimeStr = "{0:hh\:mm\:ss}" -f $this.Stopwatch.Elapsed
+        # System stats
+        Write-Host "GPU Diagnostics:" -ForegroundColor $script:Colors.Info
+        Write-Host ("  Runtime:              {0:hh\:mm\:ss}" -f $RuntimeStr) -ForegroundColor $script:Colors.Value
+        Write-Host ("  Measurements:         {0}" -f $SampleCount) -ForegroundColor $script:Colors.Value
+        Write-Host ("  Measurement Interval: {0}s" -f $this.SampleIntervalMs) -ForegroundColor $script:Colors.Value
+        Write-Host ("  Tracked Processes:    {0}" -f $this.ProcessEnergyJoules.Count) -ForegroundColor $script:Colors.Value
+        Write-Host ("  Idle GPU Power:       {0:N2}W [Min: {1:N2}W  Max:{2:N2}W] with {3} Processes" -f $this.GpuIdlePower, $this.GpuIdlePowerMin, $this.GpuIdlePowerMax, $this.IdleProcessCount) -ForegroundColor Yellow
+        Write-Host ("  Idle GPU Temperature: {0:F1}C" -f $this.GpuIdleTemperatureC) -ForegroundColor Yellow
+        Write-Host ("  Idle GPU Fan Util.:   {0:F1}%" -f $this.GpuIdleFanPercent) -ForegroundColor Yellow
+        Write-Host ("  GPU Power Now:        {0:F2}W" -f $this.GpuCurrentPower) -ForegroundColor $script:Colors.Value
+        Write-Host ("  Accumulative Average: {0:F2}W" -f $avgGpuPower) -ForegroundColor $script:Colors.Value
+        Write-Host ("  Total GPU Energy:     {0:F2}J" -f $this.GpuEnergyJoules) -ForegroundColor Yellow
+        
         if ($this.ProcessEnergyJoules.Count -eq 0) {
             Write-Host "No process energy data recorded."
             return
@@ -690,8 +697,16 @@ class GPUProcessMonitor {
         if ($sumTotalProcessesEnergy -gt 0) {
             $diff = [math]::Abs([double]$this.GpuEnergyJoules - $sumTotalProcessesEnergy)
             $diffPct = if ($this.GpuEnergyJoules -gt 0) { 100.0 * $diff / $this.GpuEnergyJoules } else { 0.0 }
-            Write-Log("DIAGNOSTIC: Measured total {0:F2} J vs summed attributed {1:F2} J -> Diff: {2:F2} J ({3:F1}%)" -f $this.GpuEnergyJoules, $sumTotalProcessesEnergy, $diff, $diffPct)
+            Write-Host("  Measured GPU total {0:F2}J vs Summed Process Attributed {1:F2}J -> Diff: {2:F2}J ({3:F1}%)" -f $this.GpuEnergyJoules, $sumTotalProcessesEnergy, $diff, $diffPct) -ForegroundColor Yellow
         }
+        else {
+            Write-Host ""
+        }
+        Write-Host ""
+
+        Write-Host "Top GPU Processes:" -ForegroundColor $script:Colors.Highlight
+        Write-Host ("{0,-15} {1,-30} {2,-25:F2} {3,-20:F2} {4:F1}%" -f "PID/s", "Process Name", "Accumulated Energy (J)", "Average Power (W)", "All Time Energy Contribution (%)") -ForegroundColor $script:Colors.Header
+        Write-Host ("-" * 75) -ForegroundColor $script:Colors.Header
 
         # Aggregate by process name and print
         $agg = @{}
@@ -709,7 +724,7 @@ class GPUProcessMonitor {
             $avgPowerProc = if ($safeDuration -gt 0) { $energy / $safeDuration } else { 0.0 }
             $pct = if ($sumTotalProcessesEnergy -gt 0) { 100.0 * $energy / $sumTotalProcessesEnergy } else { 0.0 }
             $pidList = ($_.Value.Pids -join ',')
-            Write-Host ("{0,-30} Accumulative: {1,8:F2} J  |  Average: {2,6:F2} W  ({3,5:F1}%)  PIDs: {4}" -f $name, $energy, $avgPowerProc, $pct, $pidList)
+            Write-Host ("{0,-15} {1,-30} {2,-25:F2} {3,-20:F2} {4:F1}%" -f $pidList, $name, $energy, $avgPowerProc, $pct) -ForegroundColor Yellow
         }
     }
     #endregion

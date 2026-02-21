@@ -122,7 +122,8 @@ $script:GpuMonitor = $null
 function Show-TopList {
     param(
         [int]$Count,
-        [bool]$ClearScreen = $true
+        [bool]$ClearScreen = $true,
+        [int]$SampleCount
     )
     
     if ($Count -lt 1) { $Count = 1 }
@@ -196,6 +197,9 @@ function Show-TopList {
         Write-Host ("{0,-5} {1,-30} {2,12} {3,10} {4,12}" -f $rank, $proc.Key, $cpuEnergy, $currentCpu, $currentPower) -ForegroundColor $color
         $rank++
     }
+
+    Write-Host "`n==== GPU POWER SUMMARY ====" -ForegroundColor $script:Colors.Header
+    try { $script:GpuMonitor.Report($SampleCount) } catch {}
     
     Write-Host ""
     Write-Host "Commands: list X | focus X | interval X | help | quit" -ForegroundColor $script:Colors.Info
@@ -302,6 +306,7 @@ function Start-CommandLineMode {
     Write-Host "========================================================" -ForegroundColor $script:Colors.Header
     Write-Host ""
     Write-Host "CPU: $($script:CpuHardware.Name)" -ForegroundColor $script:Colors.Value
+    Write-Host "GPU: $($script:GpuMonitor.GpuName)" -ForegroundColor $script:Colors.Value
     
     $testSystemPower = Get-SystemPowerConsumption
     if ($null -eq $testSystemPower) {
@@ -312,6 +317,9 @@ function Start-CommandLineMode {
     }
     
     Write-Host ""
+    # Measure idle metrics
+    Write-Host "Measuring idle GPU power..."
+    $script:GpuMonitor.MeasureIdleMetrics()
     Write-Host "Collecting initial data..." -ForegroundColor $script:Colors.Info
     
     # Collect initial data
@@ -320,11 +328,6 @@ function Start-CommandLineMode {
         Start-Sleep -Seconds $IntervalSeconds
         Write-Host "." -NoNewline -ForegroundColor $script:Colors.Info
     }
-    
-    # Prompt user to start workload
-    Write-Host ""; Write-Log("READY: Start the workload now.")
-    Write-Host "Press ENTER when the workload is running and you want to begin sampling..."
-    [void][System.Console]::ReadLine()
 
     Write-Host "`n`nStarting with list 20 view...`n" -ForegroundColor Green
     Start-Sleep -Seconds 1
@@ -419,7 +422,7 @@ function Start-CommandLineMode {
                             }
                             $script:CurrentView = "list"
                             $script:CurrentViewParam = $count
-                            Show-TopList -Count $script:CurrentViewParam -ClearScreen $true
+                            Show-TopList -Count $script:CurrentViewParam -ClearScreen $true -
                             [Console]::CursorVisible = $true
                         }
                         'focus' {
@@ -529,10 +532,6 @@ function Start-CommandLineMode {
 
         # flush and close writers to ensure files are written (Ctrl+C and shutdown)
         try { $script:GpuMonitor.CloseWriters() } catch {}
-
-        $Duration = $script:GpuMonitor.Stopwatch.Elapsed.TotalSeconds
-        Write-Log("Collected $sampleCount samples over $Duration seconds.")
-        try { $script:GpuMonitor.Report($Duration) } catch {}
     }
 }
 
@@ -553,7 +552,7 @@ if (-not $isAdmin) {
 
 Clear-Host
 Write-Host "`nInitializing Interactive Process Power Monitor..." -ForegroundColor Cyan
-Write-Host "=" * 60 -ForegroundColor Cyan
+Write-Host ("=" * 60) -ForegroundColor Cyan
 
 $initialized = Initialize-LibreHardwareMonitor
 
