@@ -17,7 +17,7 @@ A PowerShell-based tool for monitoring power consumption of individual processes
 
 ## Versions
 
-### ProcessPowerMeter-Interactive.ps1 (⭐ Recommended)
+### Combined/run.ps1 (⭐ Recommended)
 - **Interactive CLI**: Similar to `top`/`htop` with auto-refreshing display
 - **Commands**: `list X`, `focus X`, `interval X`, `help`, `quit`
 - **Continuous monitoring**: Energy accumulates from program start
@@ -27,31 +27,8 @@ A PowerShell-based tool for monitoring power consumption of individual processes
 - **Requires administrator privileges** for RAPL access
 - Best for: Extended monitoring sessions, energy consumption analysis over time
 
-### ProcessPowerMeter-Multi.ps1 (Most Flexible)
-- **Multiple power sources**: Choose between LibreHardwareMonitor RAPL, Intel PCM, or Windows Power Meter
-- Interactive source selection on startup
-- Automatically detects available power measurement backends
-- Supports switching between sources without restarting
-- **Requires administrator privileges** for RAPL/PCM sources
-- Best for systems with Intel PCM installed or when comparing different measurement methods
-
-### ProcessPowerMeter-CPU.ps1 (Most Accurate)
-- **Dual measurement**: Intel RAPL (CPU package) + System-wide power side-by-side
-- **Requires administrator privileges**
-- Requires LibreHardwareMonitorLib.dll and OpenHardwareMonitor service
-- Shows both CPU-only and total system power simultaneously
-- Best for detailed CPU power analysis
-
-### ProcessPowerMeter.ps1 (Simplest)
-- Uses system-wide Power Meter counters only
-- No administrator privileges required
-- Works on any Windows system with Power Meter support
-- Single measurement type (system total)
-- Best for quick system-wide power estimates
 
 ## Requirements
-
-### For ProcessPowerMeter-Interactive.ps1:
 - **Intel CPU with RAPL support** (Sandy Bridge or newer, 2011+)
   - Check with: `wmic cpu get name`
   - i3/i5/i7/i9 from 2011 onwards
@@ -60,15 +37,6 @@ A PowerShell-based tool for monitoring power consumption of individual processes
 - **LibreHardwareMonitorLib.dll** (included in repository)
 - Windows Power Meter counters (optional, for system-wide measurement)
 
-### For ProcessPowerMeter-CPU.ps1:
-- Intel CPU with RAPL support (Sandy Bridge or newer, 2011+)
-- Windows PowerShell 5.1 or later
-- **Administrator privileges required**
-- LibreHardwareMonitorLib.dll (included)
-
-### For Prototype Versions:
-See individual script headers in the `prototypes/` folder for specific requirements.
-Most require administrator privileges and LibreHardwareMonitorLib.dll.
 
 ## How It Works
 
